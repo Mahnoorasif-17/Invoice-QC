@@ -1,16 +1,14 @@
 """
 Invoice QC Tool — Streamlit version.
 
-Replaces the API-powered HTML tool. All processing is local:
-  • Excel parsing      → pandas + openpyxl
-  • PDF data extraction → pdfplumber (no Claude API needed)
-  • QC rules           → qc_engine.run_qc() (direct port of the JS logic)
+Local-only — no API keys, no network calls at runtime.
+  Excel parsing       → pandas + openpyxl
+  PDF data extraction → pdfplumber
+  QC rules            → qc_engine.run_qc()
 
-Run locally:    streamlit run app.py
-Deploy free:    push to GitHub → share.streamlit.io → New app → point at app.py
+Run:    streamlit run app.py
 """
 
-import io
 from collections import defaultdict
 from datetime import datetime
 
@@ -29,38 +27,37 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Minimal CSS to match the original look-and-feel
 st.markdown("""
 <style>
   .main .block-container { padding-top: 1.2rem; padding-bottom: 3rem; max-width: 1200px; }
   .qc-hdr {
-    background: #1a2942; color: #fff; padding: 18px 24px; border-radius: 12px;
-    margin-bottom: 16px; box-shadow: 0 2px 10px rgba(0,0,0,.15);
+    background:#1a2942;color:#fff;padding:18px 24px;border-radius:12px;
+    margin-bottom:16px;box-shadow:0 2px 10px rgba(0,0,0,.15);
   }
-  .qc-hdr h1 { font-size: 22px; margin: 0; font-weight: 700; }
-  .qc-hdr .sub { font-size: 11px; opacity: .55; margin-top: 2px;
-                 text-transform: uppercase; letter-spacing: .4px; }
+  .qc-hdr h1 { font-size:22px;margin:0;font-weight:700; }
+  .qc-hdr .sub { font-size:11px;opacity:.55;margin-top:2px;
+                 text-transform:uppercase;letter-spacing:.4px; }
   .ctx-pill {
-    background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.13);
-    border-radius: 8px; padding: 8px 14px; display: inline-block; margin: 4px 6px 0 0;
+    background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.13);
+    border-radius:8px;padding:8px 14px;display:inline-block;margin:4px 6px 0 0;
   }
-  .ctx-pill .lbl { font-size: 10px; opacity: .55; display: block;
-                   text-transform: uppercase; letter-spacing: .4px; }
-  .ctx-pill .val { font-size: 12px; font-weight: 600; color: #fff; }
-  .ctx-pill.hl  { background: rgba(251,191,36,.15); border-color: rgba(251,191,36,.4); }
-  .ctx-pill.hl .val { color: #fbbf24; }
-  .badge-auto { background:#3b82f6; color:#fff; font-size:10px; font-weight:700;
-                padding:3px 10px; border-radius:10px; }
-  .badge-man  { background:#f59e0b; color:#1a2942; font-size:10px; font-weight:700;
-                padding:3px 10px; border-radius:10px; }
-  .pill-err { background:#fee2e2; color:#dc2626; padding:2px 8px; border-radius:4px;
-              font-size:10px; font-weight:700; letter-spacing:.3px; }
-  .pill-pep { background:#ffedd5; color:#c2410c; padding:2px 8px; border-radius:4px;
-              font-size:10px; font-weight:700; letter-spacing:.3px; }
-  .pill-wrn { background:#fef3c7; color:#b45309; padding:2px 8px; border-radius:4px;
-              font-size:10px; font-weight:700; letter-spacing:.3px; }
-  .pill-apr { background:#ede9fe; color:#6d28d9; padding:2px 8px; border-radius:4px;
-              font-size:10px; font-weight:700; letter-spacing:.3px; }
+  .ctx-pill .lbl { font-size:10px;opacity:.55;display:block;
+                   text-transform:uppercase;letter-spacing:.4px; }
+  .ctx-pill .val { font-size:12px;font-weight:600;color:#fff; }
+  .ctx-pill.hl  { background:rgba(251,191,36,.15);border-color:rgba(251,191,36,.4); }
+  .ctx-pill.hl .val { color:#fbbf24; }
+  .badge-auto { background:#3b82f6;color:#fff;font-size:10px;font-weight:700;
+                padding:3px 10px;border-radius:10px; }
+  .badge-man  { background:#f59e0b;color:#1a2942;font-size:10px;font-weight:700;
+                padding:3px 10px;border-radius:10px; }
+  .pill-err { background:#fee2e2;color:#dc2626;padding:2px 8px;border-radius:4px;
+              font-size:10px;font-weight:700;letter-spacing:.3px; }
+  .pill-pep { background:#ffedd5;color:#c2410c;padding:2px 8px;border-radius:4px;
+              font-size:10px;font-weight:700;letter-spacing:.3px; }
+  .pill-wrn { background:#fef3c7;color:#b45309;padding:2px 8px;border-radius:4px;
+              font-size:10px;font-weight:700;letter-spacing:.3px; }
+  .pill-apr { background:#ede9fe;color:#6d28d9;padding:2px 8px;border-radius:4px;
+              font-size:10px;font-weight:700;letter-spacing:.3px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -76,16 +73,13 @@ if 'filter' not in st.session_state:
 auto_m, auto_y = auto_detect_month()
 today = datetime.now()
 
-# Build 18 months back, 2 months forward (mirrors original tool)
 options = []
 for i in range(-18, 3):
     yy = today.year
-    mm = today.month + i               # 1-indexed for arithmetic
-    while mm > 12:
-        mm -= 12; yy += 1
-    while mm < 1:
-        mm += 12; yy -= 1
-    options.append((mm - 1, yy))       # store as (0-indexed month, year)
+    mm = today.month + i
+    while mm > 12: mm -= 12; yy += 1
+    while mm < 1:  mm += 12; yy -= 1
+    options.append((mm - 1, yy))
 
 default_idx = next((i for i, (m, y) in enumerate(options)
                     if m == auto_m and y == auto_y), 18)
@@ -95,8 +89,7 @@ st.markdown(
     '<div class="qc-hdr">'
     '<h1>📋 Invoice QC Tool</h1>'
     '<div class="sub">Redirect Health · Automated Quality Control</div>'
-    '</div>',
-    unsafe_allow_html=True,
+    '</div>', unsafe_allow_html=True,
 )
 
 col_l, col_r = st.columns([3, 2])
@@ -112,8 +105,8 @@ is_auto = (sel_m == auto_m and sel_y == auto_y)
 ctx = build_context(sel_m, sel_y)
 
 with col_l:
-    badge_html = ('<span class="badge-auto">AUTO</span>' if is_auto
-                  else '<span class="badge-man">MANUAL</span>')
+    badge = ('<span class="badge-auto">AUTO</span>' if is_auto
+             else '<span class="badge-man">MANUAL</span>')
     pills = [
         ('Prep Window',     ctx['prepLabel'],      False),
         ('Data Window',     ctx['windowLabel'],    False),
@@ -127,17 +120,16 @@ with col_l:
     )
     st.markdown(
         f'<div style="background:#1a2942;padding:14px 18px;border-radius:10px;">'
-        f'<div style="margin-bottom:6px;">{badge_html} '
+        f'<div style="margin-bottom:6px;">{badge} '
         f'<span style="color:#fff;font-weight:700;font-size:14px;margin-left:10px;">'
         f'{ctx["label"]} Invoice</span></div>'
-        f'{pills_html}</div>',
-        unsafe_allow_html=True,
+        f'{pills_html}</div>', unsafe_allow_html=True,
     )
 
 st.write("")
 
 
-# ─── UPLOAD STAGE (only show if no results yet) ─────────────────────
+# ─── UPLOAD STAGE ───────────────────────────────────────────────────
 if st.session_state.results is None:
     st.subheader(f"📁 Upload Files to QC — {ctx['label']} Invoice")
 
@@ -154,7 +146,7 @@ if st.session_state.results is None:
 
     with col_pdfs:
         st.markdown("**📄 Invoice PDFs**")
-        st.caption("Add one or many — they accumulate in the list below")
+        st.caption("Add one or many — they accumulate")
         pdf_files = st.file_uploader(
             "PDFs", type=['pdf'], accept_multiple_files=True,
             label_visibility='collapsed', key='pdf_up',
@@ -174,7 +166,6 @@ if st.session_state.results is None:
     if st.button(btn_label, disabled=not can_run,
                  use_container_width=True, type='primary'):
         try:
-            # ── Parse Excel ──────────────────────────────────────────
             with st.spinner("Parsing Excel file..."):
                 df = pd.read_excel(excel_file)
                 rows = df.to_dict('records')
@@ -184,7 +175,6 @@ if st.session_state.results is None:
                 gid = str(r.get('Identifier', '') or '').strip()
                 groups[gid].append(r)
 
-            # ── Process each PDF ────────────────────────────────────
             results = []
             prog = st.progress(0.0, text="Starting...")
             for i, pdf_file in enumerate(pdf_files):
@@ -204,10 +194,9 @@ if st.session_state.results is None:
                         'groupId': '', 'groupName': f'❌ Parse error: {pdf_file.name}',
                         'invoiceAmount': 0, 'currentPeriodAmount': 0,
                         'adjCharges': 0, 'adjCredits': 0,
-                        'mi': [], 'la': [],
+                        'mi': [], 'la': [], 'validations': [],
                         'hasErrors': True, 'hasWarnings': False, 'isClean': False,
-                        '_pdf_name': pdf_file.name, '_raw_text': '',
-                        '_error': str(e),
+                        '_pdf_name': pdf_file.name, '_raw_text': '', '_error': str(e),
                     })
                 prog.progress((i + 1) / len(pdf_files),
                               text=f"Done {i + 1} / {len(pdf_files)}")
@@ -230,7 +219,12 @@ else:
     late_c  = sum(len(r['la']) for r in R)
     total_a = sum((r.get('invoiceAmount') or 0) for r in R)
 
-    # Results header strip
+    # Validation tallies across all groups
+    all_validations = [v for r in R for v in r.get('validations', [])]
+    v_ok    = sum(1 for v in all_validations if v['status'] == 'ok')
+    v_flag  = sum(1 for v in all_validations if v['status'] == 'flag')
+    v_wrong = sum(1 for v in all_validations if v['status'] == 'incorrect')
+
     st.markdown(
         f'<div style="background:#f0f4ff;border:1px solid #c7d2fe;border-radius:10px;'
         f'padding:10px 16px;margin-bottom:14px;font-size:12px;color:#4338ca;'
@@ -245,11 +239,18 @@ else:
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("🔴 Critical Errors", err_c)
     c2.metric("🟡 Warnings",        warn_c)
-    c3.metric("⚠️ Needs Approval",  late_c)
+    c3.metric("⚠️ Late (Approval)", late_c)
     c4.metric("✅ Clean Groups",    clean_c)
     c5.metric("Total Value",        f"${total_a:,.0f}")
 
-    # Filter bar
+    # Adjustment validation summary row
+    if all_validations:
+        v1, v2, v3, v4 = st.columns(4)
+        v1.metric("📊 PDF Adjustments", len(all_validations))
+        v2.metric("✅ OK",         v_ok)
+        v3.metric("🟡 Flagged",    v_flag)
+        v4.metric("🔴 Incorrect",  v_wrong)
+
     f_col, _, reset_col = st.columns([4, 4, 1.5])
     with f_col:
         filt = st.radio(
@@ -272,29 +273,25 @@ else:
             st.session_state.filter = 'all'
             st.rerun()
 
-    # Apply filter
     fil = list(R)
-    if filt == 'errors':   fil = [r for r in R if r['hasErrors']]
+    if filt == 'errors':     fil = [r for r in R if r['hasErrors']]
     elif filt == 'warnings': fil = [r for r in R if r['hasWarnings']]
     elif filt == 'clean':    fil = [r for r in R if r['isClean']]
-    # Errors first, then warnings, then clean
     fil.sort(key=lambda r: 0 if r['hasErrors'] else 1 if r['hasWarnings'] else 2)
 
-    # Render each group
+    # ── PER-GROUP RENDER ────────────────────────────────────────────
     for g in fil:
-        if g['hasErrors']:
-            tag, dot = "🔴 ERRORS", "🔴"
-        elif g['hasWarnings']:
-            tag, dot = "🟡 WARNINGS", "🟡"
-        else:
-            tag, dot = "🟢 CLEAN", "🟢"
-        total_iss = len(g['mi']) + len(g['la'])
+        if g['hasErrors']:    tag, dot = "🔴 ERRORS",   "🔴"
+        elif g['hasWarnings']: tag, dot = "🟡 WARNINGS", "🟡"
+        else:                 tag, dot = "🟢 CLEAN",    "🟢"
+        n_iss = len(g['mi']) + len(g['la'])
+        n_val_issues = sum(1 for v in g.get('validations', [])
+                           if v['status'] in ('flag', 'incorrect'))
         amt = g.get('invoiceAmount') or 0
         title = (f"{dot}  {g.get('groupName') or 'Unknown'}  "
-                 f"·  {g.get('groupId') or '—'}  "
-                 f"·  ${amt:,.0f}")
-        if total_iss:
-            title += f"  ·  {total_iss} issue{'s' if total_iss != 1 else ''}"
+                 f"·  {g.get('groupId') or '—'}  ·  ${amt:,.0f}")
+        if n_iss:        title += f"  ·  {n_iss} issue{'s' if n_iss != 1 else ''}"
+        if n_val_issues: title += f"  ·  {n_val_issues} adj-flag{'s' if n_val_issues != 1 else ''}"
         title += f"  ·  {tag}"
 
         with st.expander(title, expanded=g['hasErrors']):
@@ -303,35 +300,63 @@ else:
             a1.metric("Current Period", f"${(g.get('currentPeriodAmount') or 0):,.0f}")
             a2.metric("Adj Charges",    f"${(g.get('adjCharges') or 0):,.0f}")
             credits = g.get('adjCredits') or 0
-            a3.metric("Adj Credits",
-                      f"-${abs(credits):,.0f}" if credits else "$0")
-            a4.metric("Invoice Total",  f"${amt:,.0f}")
+            a3.metric("Adj Credits", f"-${abs(credits):,.0f}" if credits else "$0")
+            a4.metric("Invoice Total", f"${amt:,.0f}")
 
             if g.get('_error'):
                 st.error(f"Parse error: {g['_error']}")
 
-            if g['isClean'] and not g['la']:
-                st.success("✅ All checks passed — no issues found")
-
             # Member issues
-            for m in g['mi']:
-                st.markdown(f"**👤 {m['name']}**")
-                for i in m['iss']:
-                    pill_class = {
-                        'error': 'pill-err', 'pepm': 'pill-pep',
-                        'warning': 'pill-wrn', 'approval': 'pill-apr',
-                    }[i['sev']]
-                    label = {
-                        'error': 'ERROR', 'pepm': 'PEPM',
-                        'warning': 'WARN', 'approval': 'APPROVAL',
-                    }[i['sev']]
-                    st.markdown(
-                        f'<div style="margin:4px 0 4px 14px;">'
-                        f'<span class="{pill_class}">{label}</span> '
-                        f'<span style="font-size:13px;color:#374151;">{i["msg"]}</span>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
+            if g['mi']:
+                st.markdown("##### Member Issues")
+                for m in g['mi']:
+                    st.markdown(f"**👤 {m['name']}**")
+                    for i in m['iss']:
+                        pill_class = {'error': 'pill-err', 'pepm': 'pill-pep',
+                                      'warning': 'pill-wrn', 'approval': 'pill-apr'}[i['sev']]
+                        label = {'error': 'ERROR', 'pepm': 'PEPM',
+                                 'warning': 'WARN', 'approval': 'APPROVAL'}[i['sev']]
+                        st.markdown(
+                            f'<div style="margin:4px 0 4px 14px;">'
+                            f'<span class="{pill_class}">{label}</span> '
+                            f'<span style="font-size:13px;color:#374151;">{i["msg"]}</span>'
+                            f'</div>', unsafe_allow_html=True,
+                        )
+
+            # ── NEW: PDF Adjustment Validation Table ────────────────
+            vals = g.get('validations', [])
+            if vals:
+                st.markdown("##### 📋 PDF Adjustment Validation")
+
+                ok_n    = sum(1 for v in vals if v['status'] == 'ok')
+                fl_n    = sum(1 for v in vals if v['status'] == 'flag')
+                wrong_n = sum(1 for v in vals if v['status'] == 'incorrect')
+                st.caption(f"✅ {ok_n} OK · 🟡 {fl_n} flagged · 🔴 {wrong_n} incorrect")
+
+                v_df = pd.DataFrame([{
+                    'Status':   {'ok': '✅ OK', 'flag': '🟡 FLAG',
+                                 'incorrect': '🔴 INCORRECT'}[v['status']],
+                    'Type':     v['type'],
+                    'Member':   v['name'],
+                    'Coverage Month': v['month'],
+                    'Plan':     v.get('planCode', ''),
+                    'Amount':   f"${abs(v['cost']):,.2f}" + (' (cr)' if v['type'] == 'Credit' else ''),
+                    'Reason':   v['reason'],
+                } for v in vals])
+
+                def _row_color(row):
+                    if row['Status'].startswith('🔴'): bg = '#fee2e2'
+                    elif row['Status'].startswith('🟡'): bg = '#fef3c7'
+                    else: bg = '#dcfce7'
+                    return [f'background-color: {bg}'] * len(row)
+
+                st.dataframe(
+                    v_df.style.apply(_row_color, axis=1),
+                    use_container_width=True, hide_index=True,
+                )
+
+            if g['isClean'] and not g['la'] and not vals:
+                st.success("✅ All checks passed — no issues found")
 
             # Late adjustments
             if g['la']:
@@ -340,20 +365,19 @@ else:
                 la_df['cost'] = la_df['cost'].apply(lambda x: f"${abs(x):,.2f}")
                 st.dataframe(la_df, use_container_width=True, hide_index=True)
 
-            # Debug — raw PDF text (helpful for tuning the extractor)
+            # Debug — raw PDF text
             with st.expander("🔎 Debug — raw extracted text from this PDF"):
                 st.text(g.get('_raw_text', '') or '(no text extracted)')
 
-    # ── EXPORT ──────────────────────────────────────────────────────
+    # ── EXPORTS ─────────────────────────────────────────────────────
     st.divider()
-    st.subheader("Export")
+    st.subheader("Export Reports")
 
-    # Build a flat dataframe of all issues for CSV export
-    export_rows = []
+    issues_rows = []
     for g in R:
         for m in g['mi']:
             for i in m['iss']:
-                export_rows.append({
+                issues_rows.append({
                     'Group ID':    g['groupId'],
                     'Group Name':  g['groupName'],
                     'Member':      m['name'],
@@ -362,7 +386,7 @@ else:
                     'Invoice Amt': g.get('invoiceAmount') or 0,
                 })
         for a in g['la']:
-            export_rows.append({
+            issues_rows.append({
                 'Group ID':    g['groupId'],
                 'Group Name':  g['groupName'],
                 'Member':      a['name'],
@@ -371,15 +395,42 @@ else:
                 'Invoice Amt': g.get('invoiceAmount') or 0,
             })
 
-    if export_rows:
-        export_df = pd.DataFrame(export_rows)
-        csv_bytes = export_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            "⬇️ Download all issues as CSV",
-            data=csv_bytes,
-            file_name=f"qc_report_{ctx['label'].replace(' ', '_')}.csv",
-            mime='text/csv',
-            use_container_width=True,
-        )
-    else:
-        st.info("No issues to export — everything is clean! 🎉")
+    valid_rows = []
+    for g in R:
+        for v in g.get('validations', []):
+            valid_rows.append({
+                'Group ID':       g['groupId'],
+                'Group Name':     g['groupName'],
+                'Member':         v['name'],
+                'Adjustment Type': v['type'],
+                'Coverage Month': v['month'],
+                'Plan':           v.get('planCode', ''),
+                'Amount':         v['cost'],
+                'Status':         v['status'].upper(),
+                'Reason':         v['reason'],
+            })
+
+    e_col1, e_col2 = st.columns(2)
+    with e_col1:
+        if issues_rows:
+            csv_bytes = pd.DataFrame(issues_rows).to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "⬇️ Issues report (CSV)",
+                data=csv_bytes,
+                file_name=f"qc_issues_{ctx['label'].replace(' ', '_')}.csv",
+                mime='text/csv', use_container_width=True,
+            )
+        else:
+            st.info("No Excel-driven issues to export 🎉")
+
+    with e_col2:
+        if valid_rows:
+            csv_bytes = pd.DataFrame(valid_rows).to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "⬇️ Adjustment validation report (CSV)",
+                data=csv_bytes,
+                file_name=f"adjustment_validation_{ctx['label'].replace(' ', '_')}.csv",
+                mime='text/csv', use_container_width=True,
+            )
+        else:
+            st.info("No PDF adjustments to validate")
