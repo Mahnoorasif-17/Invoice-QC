@@ -290,8 +290,8 @@ else:
         amt = g.get('invoiceAmount') or 0
         title = (f"{dot}  {g.get('groupName') or 'Unknown'}  "
                  f"·  {g.get('groupId') or '—'}  ·  ${amt:,.0f}")
-        if n_iss:        title += f"  ·  {n_iss} issue{'s' if n_iss != 1 else ''}"
-        if n_val_issues: title += f"  ·  {n_val_issues} adj-flag{'s' if n_val_issues != 1 else ''}"
+        if n_iss:        title += f"  ·  {n_iss} billing issue{'s' if n_iss != 1 else ''}"
+        if n_val_issues: title += f"  ·  {n_val_issues} adj/credit issue{'s' if n_val_issues != 1 else ''}"
         title += f"  ·  {tag}"
 
         with st.expander(title, expanded=g['hasErrors']):
@@ -306,9 +306,9 @@ else:
             if g.get('_error'):
                 st.error(f"Parse error: {g['_error']}")
 
-            # Member issues
+            # Billing issues (Rules 1-4)
             if g['mi']:
-                st.markdown("##### Member Issues")
+                st.markdown("##### 🧾 Billing Issues (Excel-internal)")
                 for m in g['mi']:
                     st.markdown(f"**👤 {m['name']}**")
                     for i in m['iss']:
@@ -323,10 +323,15 @@ else:
                             f'</div>', unsafe_allow_html=True,
                         )
 
-            # ── NEW: PDF Adjustment Validation Table ────────────────
+            # ── ADJUSTMENT/CREDIT VALIDATION REPORT ────────────────
             vals = g.get('validations', [])
             if vals:
-                st.markdown("##### 📋 PDF Adjustment Validation")
+                st.markdown("##### 📋 Adjustments & Credits — Excel ↔ PDF Validation")
+                st.caption(
+                    "Excel is the source of truth. **OK** = PDF matches Excel · "
+                    "**FLAG** = Excel predicts this adjustment but PDF is missing it · "
+                    "**INCORRECT** = PDF has an entry that contradicts Excel."
+                )
 
                 ok_n    = sum(1 for v in vals if v['status'] == 'ok')
                 fl_n    = sum(1 for v in vals if v['status'] == 'flag')
@@ -339,7 +344,7 @@ else:
                     'Type':     v['type'],
                     'Member':   v['name'],
                     'Coverage Month': v['month'],
-                    'Plan':     v.get('planCode', ''),
+                    'Plan':     v.get('plan', '') or v.get('planCode', ''),
                     'Amount':   f"${abs(v['cost']):,.2f}" + (' (cr)' if v['type'] == 'Credit' else ''),
                     'Reason':   v['reason'],
                 } for v in vals])
@@ -404,7 +409,7 @@ else:
                 'Member':         v['name'],
                 'Adjustment Type': v['type'],
                 'Coverage Month': v['month'],
-                'Plan':           v.get('planCode', ''),
+                'Plan':           v.get('plan', '') or v.get('planCode', ''),
                 'Amount':         v['cost'],
                 'Status':         v['status'].upper(),
                 'Reason':         v['reason'],
@@ -415,9 +420,9 @@ else:
         if issues_rows:
             csv_bytes = pd.DataFrame(issues_rows).to_csv(index=False).encode('utf-8')
             st.download_button(
-                "⬇️ Issues report (CSV)",
+                "⬇️ Billing issues (CSV)",
                 data=csv_bytes,
-                file_name=f"qc_issues_{ctx['label'].replace(' ', '_')}.csv",
+                file_name=f"billing_issues_{ctx['label'].replace(' ', '_')}.csv",
                 mime='text/csv', use_container_width=True,
             )
         else:
@@ -427,9 +432,9 @@ else:
         if valid_rows:
             csv_bytes = pd.DataFrame(valid_rows).to_csv(index=False).encode('utf-8')
             st.download_button(
-                "⬇️ Adjustment validation report (CSV)",
+                "⬇️ Adjustments & credits report (CSV)",
                 data=csv_bytes,
-                file_name=f"adjustment_validation_{ctx['label'].replace(' ', '_')}.csv",
+                file_name=f"adjustments_credits_{ctx['label'].replace(' ', '_')}.csv",
                 mime='text/csv', use_container_width=True,
             )
         else:
