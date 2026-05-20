@@ -19,6 +19,7 @@ There is NO duplication — Rules 5 and 6 from the old version (which lived in
 member_issues) are gone. All adjustment logic is now in validate_adjustments().
 """
 
+import calendar
 import re
 from datetime import datetime
 from typing import Optional, Any
@@ -103,6 +104,26 @@ def to_float(v: Any) -> Optional[float]:
 
 def month_floor(d: datetime) -> datetime:
     return datetime(d.year, d.month, 1)
+
+
+def is_last_day_of_month(d: datetime) -> bool:
+    """True if d is the last calendar day of its month (e.g. Apr 30, Feb 28/29)."""
+    return d.day == calendar.monthrange(d.year, d.month)[1]
+
+
+def next_month(d: datetime) -> datetime:
+    """Return the 1st of the month after d."""
+    if d.month == 12:
+        return datetime(d.year + 1, 1, 1)
+    return datetime(d.year, d.month + 1, 1)
+
+
+def months_between(start_month: datetime, end_exclusive: datetime):
+    """Yield month-1st datetimes from start_month up to but not including end_exclusive."""
+    cur = start_month
+    while cur < end_exclusive:
+        yield cur
+        cur = next_month(cur)
 
 
 # ── CONTEXT ─────────────────────────────────────────────────────────
@@ -305,51 +326,55 @@ def validate_adjustments(rows: list, pdf_data: dict, ctx: dict) -> list:
         plan = str(row.get('CarrierPlanCode') or '').strip()
         plan_cost = to_float(row.get('PlanCost')) or 0
 
-        # ── Expected adjustment CHARGE: enrolled in data window AND
-        #    start month is BEFORE the invoice month
+        # ── Expected adjustment CHARGES: enrolled in data window AND start
+        #    month is BEFORE the invoice month. Predict ONE charge per missed
+        #    month — from start_month through (invoice_month − 1) inclusive.
         if eo and in_window(eo, ctx['windowStart'], ctx['windowEnd']) \
                 and st == 'Active' and sd:
             sd_month = month_floor(sd)
             if sd_month < ctx['invoiceStart']:
-                # Find matching PDF charge for this exact month
-                found_row = None
-                for m, r in pdf_charges_by_name.get(nk, []):
-                    if m == sd_month and id(r) not in matched_charges:
-                        found_row = r
-                        matched_charges.add(id(r))
-                        break
+                for predicted_m in months_between(sd_month, ctx['invoiceStart']):
+                    # Find unmatched PDF charge for this exact month
+                    found_row = None
+                    for m, r in pdf_charges_by_name.get(nk, []):
+                        if m == predicted_m and id(r) not in matched_charges:
+                            found_row = r
+                            matched_charges.add(id(r))
+                            break
 
-                if found_row is not None:
-                    validations.append({
-                        'status': 'ok',
-                        'type':   'Charge',
-                        'name':   name,
-                        'month':  format_month(sd_month),
-                        'cost':   to_float(found_row.get('cost')) or 0,
-                        'plan':   str(found_row.get('planCode', '') or ''),
-                        'reason': (f"Expected (enrolled {eo.strftime('%m/%d/%Y')}, "
-                                   f"start {sd.strftime('%m/%d/%Y')}) — found in PDF"),
-                    })
-                else:
-                    needs_appr = sd_month < ctx['boundary60']
-                    suffix = ' — NEEDS APPROVAL (>60 days)' if needs_appr else ''
-                    validations.append({
-                        'status': 'flag',
-                        'type':   'Charge',
-                        'name':   name,
-                        'month':  format_month(sd_month),
-                        'cost':   plan_cost,
-                        'plan':   plan,
-                        'reason': (f"MISSING — enrolled {eo.strftime('%m/%d/%Y')} (data window), "
-                                   f"start {sd.strftime('%m/%d/%Y')} → expected charge for "
-                                   f"{format_month(sd_month)} but PDF has none{suffix}"),
-                    })
+                    if found_row is not None:
+                        validations.append({
+                            'status': 'ok',
+                            'type':   'Charge',
+                            'name':   name,
+                            'month':  format_month(predicted_m),
+                            'cost':   to_float(found_row.get('cost')) or 0,
+                            'plan':   str(found_row.get('planCode', '') or ''),
+                            'reason': (f"Expected (enrolled {eo.strftime('%m/%d/%Y')}, "
+                                       f"start {sd.strftime('%m/%d/%Y')}) — found in PDF"),
+                        })
+                    else:
+                        needs_appr = predicted_m < ctx['boundary60']
+                        suffix = ' — NEEDS APPROVAL (>60 days)' if needs_appr else ''
+                        validations.append({
+                            'status': 'flag',
+                            'type':   'Charge',
+                            'name':   name,
+                            'month':  format_month(predicted_m),
+                            'cost':   plan_cost,
+                            'plan':   plan,
+                            'reason': (f"MISSING — enrolled {eo.strftime('%m/%d/%Y')} (data window), "
+                                       f"start {sd.strftime('%m/%d/%Y')} → expected charge for "
+                                       f"{format_month(predicted_m)} but PDF has none{suffix}"),
+                        })
 
         # ── Expected CREDIT: ended in data window AND end month is BEFORE
-        #    the invoice month (in-month ends are covered by regular billing)
+        #    the invoice month (in-month ends are covered by regular billing).
+        #    ALSO skip if end date is the LAST day of its month — the full
+        #    month was earned, so no credit is owed.
         if on and in_window(on, ctx['windowStart'], ctx['windowEnd']) and ed:
             ed_month = month_floor(ed)
-            if ed_month < ctx['invoiceStart']:
+            if ed_month < ctx['invoiceStart'] and not is_last_day_of_month(ed):
                 found_row = None
                 for m, r in pdf_credits_by_name.get(nk, []):
                     if m == ed_month and id(r) not in matched_credits:

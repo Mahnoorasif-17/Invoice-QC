@@ -295,6 +295,24 @@ else:
         title += f"  ·  {tag}"
 
         with st.expander(title, expanded=g['hasErrors']):
+            # ─── Prominent group-name banner ─────────────────────────
+            group_name = g.get('groupName') or 'Unknown Group'
+            group_id   = g.get('groupId')   or '—'
+            banner_color = ('#dc2626' if g['hasErrors']
+                            else '#b45309' if g['hasWarnings']
+                            else '#15803d')
+            st.markdown(
+                f'<div style="background:#1a2942;color:#fff;padding:14px 20px;'
+                f'border-radius:10px;margin-bottom:14px;'
+                f'border-left:6px solid {banner_color};">'
+                f'<div style="font-size:20px;font-weight:700;letter-spacing:0.2px;">'
+                f'{group_name}</div>'
+                f'<div style="font-size:12px;opacity:.75;margin-top:4px;'
+                f'font-family:monospace;">Group ID: {group_id}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
             # Amount breakdown
             a1, a2, a3, a4 = st.columns(4)
             a1.metric("Current Period", f"${(g.get('currentPeriodAmount') or 0):,.0f}")

@@ -1,31 +1,23 @@
 """
-PDF Extractor — replaces the Claude API call from the original tool.
-Uses pdfplumber to extract text + tables locally (no network, no keys).
+PDF Extractor for Redirect Health invoices.
 
-Returns the same JSON shape the API used to return:
-{
-    "groupId": str,
-    "groupName": str,
-    "invoiceAmount": float,
-    "currentPeriodAmount": float,
-    "adjustmentChargesTotal": float,
-    "adjustmentCreditsTotal": float,
-    "currentRoster":          [{firstName, lastName, tier, planCode, cost}],
-    "adjustmentChargeRoster": [{firstName, lastName, tier, planCode, coverageMonth, cost}],
-    "adjustmentCreditRoster": [{firstName, lastName, tier, planCode, coverageMonth, cost}],
-    "_raw_text": str   # for debugging — shown in the "Debug" expander in the UI
-}
+Uses TEXT-line parsing (not pdfplumber's table extraction, which strips
+columns when rule lines don't match text positions on this PDF format).
 
-⚠️  PDF layouts vary. The regex patterns and table-classification rules below are
-   best-effort defaults that cover common Redirect Health invoice layouts.
-   If your invoice format differs, tune the patterns in:
-     • _find_group_id / _find_group_name / _find_amount   (header fields)
-     • _classify_table                                    (which roster a table belongs to)
-     • _parse_roster_table                                (column mapping)
-   The raw extracted text is always returned in `_raw_text` so you can see exactly
-   what pdfplumber pulled and adjust accordingly.
+Strategy:
+  1. Read ALL pages with pdfplumber, concatenate text
+  2. Find header fields with regex (GROUP ID, INVOICE AMOUNT, etc.)
+  3. Find roster sections by their section headers:
+       CURRENT PERIOD - ROSTER
+       ADJUSTMENTS - CHARGES ROSTER
+       ADJUSTMENTS - CREDITS ROSTER
+  4. Within each section, parse member rows line-by-line
+  5. Skip Division:, Total:, and column header lines
+
+Output JSON shape matches what the QC engine expects.
 """
 
+import os
 import re
 from typing import Optional, Any
 import pdfplumber
@@ -34,233 +26,275 @@ import pdfplumber
 # ─── PUBLIC API ─────────────────────────────────────────────────────
 def extract_pdf(file_obj) -> dict:
     """Extract structured invoice data from a PDF file-like object."""
-    all_text_parts = []
-    all_tables = []
+    # Try to get a filename for group-name fallback
+    filename = getattr(file_obj, 'name', '') or ''
 
+    # Read full text from ALL pages
+    all_pages_text = []
     with pdfplumber.open(file_obj) as pdf:
         for page in pdf.pages:
-            txt = page.extract_text() or ''
-            all_text_parts.append(txt)
-            for t in (page.extract_tables() or []):
-                if t and len(t) > 0:
-                    all_tables.append(t)
-
-    text = '\n'.join(all_text_parts)
+            all_pages_text.append(page.extract_text() or '')
+    text = '\n'.join(all_pages_text)
 
     return {
-        'groupId':                  _find_group_id(text) or '',
-        'groupName':                _find_group_name(text) or '',
-        'invoiceAmount':            _find_amount(text, [
-                                        'invoice total', 'total due', 'grand total',
-                                        'amount due', 'total amount', 'total invoice'
-                                    ]) or 0,
-        'currentPeriodAmount':      _find_amount(text, [
-                                        'current period', 'current charges',
-                                        'monthly charges', 'current month'
-                                    ]) or 0,
-        'adjustmentChargesTotal':   _find_amount(text, [
-                                        'adjustment charges total', 'total adjustment charges',
-                                        'adjustment charges'
-                                    ]) or 0,
-        'adjustmentCreditsTotal':   _find_amount(text, [
-                                        'adjustment credits total', 'total adjustment credits',
-                                        'adjustment credits'
-                                    ]) or 0,
-        'currentRoster':            _collect_roster(all_tables, 'current'),
-        'adjustmentChargeRoster':   _collect_roster(all_tables, 'adj_charge'),
-        'adjustmentCreditRoster':   _collect_roster(all_tables, 'adj_credit'),
-        '_raw_text':                text,
+        'groupId':                _find_group_id(text) or '',
+        'groupName':              _find_group_name(text, filename) or '',
+        'invoiceAmount':          _find_invoice_amount(text) or 0,
+        'currentPeriodAmount':    _find_current_period_amount(text) or 0,
+        'adjustmentChargesTotal': _find_adj_total(text, 'Charges') or 0,
+        'adjustmentCreditsTotal': _find_adj_total(text, 'Credits') or 0,
+        'currentRoster':          _parse_roster(text, 'CURRENT PERIOD - ROSTER',
+                                                has_coverage_month=False),
+        'adjustmentChargeRoster': _parse_roster(text, 'ADJUSTMENTS - CHARGES ROSTER',
+                                                has_coverage_month=True),
+        'adjustmentCreditRoster': _parse_roster(text, 'ADJUSTMENTS - CREDITS ROSTER',
+                                                has_coverage_month=True),
+        '_raw_text': text,
     }
 
 
 # ─── HEADER FIELD EXTRACTION ────────────────────────────────────────
 def _find_group_id(text: str) -> Optional[str]:
-    patterns = [
-        r'Group\s*(?:ID|#|Number|No\.?)\s*:?\s*([A-Z0-9][A-Z0-9\-]{2,})',
-        r'Account\s*(?:ID|#|Number)\s*:?\s*([A-Z0-9][A-Z0-9\-]{2,})',
-        r'Customer\s*(?:ID|#|Number)\s*:?\s*([A-Z0-9][A-Z0-9\-]{2,})',
-        r'Identifier\s*:?\s*([A-Z0-9][A-Z0-9\-]{2,})',
-    ]
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    return None
+    m = re.search(r'GROUP\s*ID\s*:\s*(\S+)', text, re.IGNORECASE)
+    return m.group(1).strip() if m else None
 
 
-def _find_group_name(text: str) -> Optional[str]:
-    patterns = [
+def _find_group_name(text: str, filename: str = '') -> Optional[str]:
+    """
+    Try three strategies in order:
+      1. Look for an "Attn Company Broker" header (Redirect Health format)
+         and pull the middle column.
+      2. Look for explicit "Group Name:" / "Bill To:" labels.
+      3. Fall back to parsing the filename (e.g.
+         'Advantage_Fleet_LLC_-_May2026_-_Invoice_-_20260417.pdf'
+         → 'Advantage Fleet LLC').
+    """
+    # Strategy 1: Redirect Health "Attn Company Broker" 3-column layout
+    m = re.search(
+        r'Attn\s+Company\s+Broker\s*\n\s*\S+\s+(.+?)\s{2,}',
+        text, re.IGNORECASE
+    )
+    if m:
+        candidate = m.group(1).strip()
+        if candidate and len(candidate) > 1:
+            return candidate
+
+    # Strategy 2: explicit labels
+    for pat in (
         r'Group\s*Name\s*:?\s*([^\n\r]{2,80})',
         r'(?:Bill|Sold)\s*To\s*:?\s*([^\n\r]{2,80})',
         r'Company\s*Name\s*:?\s*([^\n\r]{2,80})',
-        r'Customer\s*Name\s*:?\s*([^\n\r]{2,80})',
-    ]
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
+    ):
+        m = re.search(pat, text, re.IGNORECASE)
         if m:
-            name = m.group(1).strip()
-            # Cut off at common separators that bleed into the next field
-            for sep in ['  ', '\t', 'Group ID', 'Group #', 'Invoice', 'Date']:
-                if sep in name:
-                    name = name.split(sep)[0].strip()
-            return name if name else None
+            return m.group(1).strip()
+
+    # Strategy 3: filename
+    if filename:
+        base = os.path.basename(filename)
+        base = os.path.splitext(base)[0]
+        # Take everything before the first " - " or "_-_" separator
+        for sep in (' - ', '_-_'):
+            if sep in base:
+                base = base.split(sep)[0]
+                break
+        # Convert underscores to spaces
+        base = base.replace('_', ' ').strip()
+        return base or None
+
     return None
 
 
-def _find_amount(text: str, keywords: list) -> Optional[float]:
-    """Find a dollar amount that follows one of the given keywords."""
-    for kw in keywords:
-        # Look for: "Keyword [:] $1,234.56" possibly with whitespace/newlines
-        pattern = re.escape(kw) + r'\s*[:.]?\s*\$?\s*\(?(-?[\d,]+(?:\.\d{1,2})?)\)?'
-        m = re.search(pattern, text, re.IGNORECASE)
+def _find_invoice_amount(text: str) -> Optional[float]:
+    """Find Total Invoice Amount / INVOICE AMOUNT."""
+    for pat in (
+        r'Total\s+Invoice\s+Amount\s*:?\s*\$?\s*\(?(-?[\d,]+\.?\d*)\)?',
+        r'INVOICE\s+AMOUNT\s*:?\s*\$?\s*\(?(-?[\d,]+\.?\d*)\)?',
+        r'Invoice\s+Total\s*:?\s*\$?\s*\(?(-?[\d,]+\.?\d*)\)?',
+    ):
+        m = re.search(pat, text, re.IGNORECASE)
         if m:
-            try:
-                val = float(m.group(1).replace(',', ''))
-                # Parenthesized amount = negative
-                start, end = m.span()
-                ctx = text[max(0, start - 1):end + 1]
-                if '(' in ctx and ')' in ctx:
-                    val = -abs(val)
-                return val
-            except ValueError:
-                continue
+            return _to_number(m.group(1))
     return None
 
 
-# ─── TABLE CLASSIFICATION + ROSTER PARSING ──────────────────────────
-def _collect_roster(tables: list, category: str) -> list:
+def _find_current_period_amount(text: str) -> Optional[float]:
+    for pat in (
+        r'Current\s+Period\s+Amount\s*:?\s*\$?\s*\(?(-?[\d,]+\.?\d*)\)?',
+        r'Total\s+Current\s+Period\s+Amount\s*:?\s*\$?\s*\(?(-?[\d,]+\.?\d*)\)?',
+    ):
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return _to_number(m.group(1))
+    return None
+
+
+def _find_adj_total(text: str, kind: str) -> Optional[float]:
+    """kind = 'Charges' or 'Credits'."""
+    for pat in (
+        rf'Total\s+Adjustments\s*[-\u2013]\s*{kind}\s*:?\s*\$?\s*\(?(-?[\d,]+\.?\d*)\)?',
+        rf'TOTAL\s+ADJUSTMENTS\s*[-\u2013]\s*{kind.upper()}\s*:?\s*\$?\s*\(?(-?[\d,]+\.?\d*)\)?',
+        rf'Adjustments?\s*[-\u2013]\s*{kind}\s+Total\s*:?\s*\$?\s*\(?(-?[\d,]+\.?\d*)\)?',
+    ):
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            val = _to_number(m.group(1))
+            return -abs(val) if kind == 'Credits' and val and val > 0 else val
+    return None
+
+
+def _to_number(s: str) -> Optional[float]:
+    if s is None:
+        return None
+    try:
+        return float(str(s).replace(',', '').replace('$', '').strip())
+    except (ValueError, TypeError):
+        return None
+
+
+# ─── ROSTER SECTION PARSING ─────────────────────────────────────────
+# Skip these lines: column headers, dividers, totals
+_SKIP_PATTERNS = [
+    re.compile(r'^\s*$'),                                   # blank
+    re.compile(r'^\s*FIRST\s+NAME\b', re.IGNORECASE),       # column header
+    re.compile(r'^\s*Division\s*:', re.IGNORECASE),         # division header
+    re.compile(r'^\s*Total\s*:', re.IGNORECASE),            # subtotal
+    re.compile(r'^\s*Subtotal\b', re.IGNORECASE),
+    re.compile(r'^\s*Grand\s+Total\b', re.IGNORECASE),
+    re.compile(r'^\s*INVOICE\s*#', re.IGNORECASE),
+    re.compile(r'^\s*INVOICE\s+DATE', re.IGNORECASE),
+    re.compile(r'^\s*GROUP\s*ID', re.IGNORECASE),
+    re.compile(r'^\s*COVERAGE\s+PERIOD', re.IGNORECASE),
+    re.compile(r'^\s*DATE\s*:', re.IGNORECASE),
+    re.compile(r'^\s*DESCRIPTION\s', re.IGNORECASE),        # other table headers
+]
+
+# Sentinel patterns: when we hit one of these, we've left the roster section
+_SECTION_BOUNDARIES = [
+    re.compile(r'^\s*CURRENT\s+PERIOD\s*-', re.IGNORECASE),
+    re.compile(r'^\s*ADJUSTMENTS?\s*-', re.IGNORECASE),
+    re.compile(r'^\s*Redirect\s+Health', re.IGNORECASE),
+    re.compile(r'^\s*Page\s+\d+\s+of', re.IGNORECASE),
+]
+
+
+def _parse_roster(text: str, section_header: str, has_coverage_month: bool) -> list:
+    """
+    Find a section by its header text, parse every member row beneath it.
+    Stops at the next section header or end of text.
+
+    Row formats:
+      No coverage month:  FirstName  LastName  Tier  PlanCode  $Cost
+      With coverage:      FirstName  LastName  Tier  PlanCode  CoverageMonth  $Cost
+    """
+    # Find section start
+    pattern = re.compile(re.escape(section_header), re.IGNORECASE)
+    m = pattern.search(text)
+    if not m:
+        return []
+
+    # Take text from section header to end (will stop at next section ourselves)
+    section_text = text[m.end():]
+    lines = section_text.split('\n')
+
     rows = []
-    for t in tables:
-        if _classify_table(t) == category:
-            rows.extend(_parse_roster_table(t, category))
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Stop at next section
+        if any(p.match(stripped) for p in _SECTION_BOUNDARIES):
+            break
+
+        # Skip non-data lines
+        if any(p.match(stripped) for p in _SKIP_PATTERNS):
+            continue
+
+        parsed = _parse_roster_row(stripped, has_coverage_month)
+        if parsed:
+            rows.append(parsed)
+
     return rows
 
 
-def _classify_table(table: list) -> Optional[str]:
+def _parse_roster_row(line: str, has_coverage_month: bool) -> Optional[dict]:
     """
-    Decide whether a table is the current roster, adjustment charges,
-    adjustment credits, or none of the above.
+    Parse one line. Returns None if it doesn't match the expected shape.
+
+    Token order (last to first):
+      [cost] [coverage_month?] [plan_code] [tier] [...name...]
     """
-    if not table or len(table) < 2:
+    # Pattern for cost: $123.45 or 123.45 or (123.45) or -123.45
+    cost_pattern = r'\$?\s*\(?(-?[\d,]+\.\d{2})\)?'
+
+    if has_coverage_month:
+        # Coverage month looks like "Mar-2026", "January 2026", "Mar 2026"
+        # Pattern: name(greedy)  tier  plan  coverage_month  cost
+        m = re.match(
+            rf'^(.+?)\s+(\S+)\s+(\S+)\s+([A-Za-z]+[-\s]\d{{4}})\s+{cost_pattern}\s*$',
+            line
+        )
+        if not m:
+            return None
+        name_part, tier, plan, cov_month, cost_str = m.groups()
+    else:
+        # Pattern: name(greedy)  tier  plan  cost
+        m = re.match(
+            rf'^(.+?)\s+(\S+)\s+(\S+)\s+{cost_pattern}\s*$',
+            line
+        )
+        if not m:
+            return None
+        name_part, tier, plan, cost_str = m.groups()
+        cov_month = None
+
+    # Split name into first/last
+    first, last = _split_name(name_part)
+    if not first and not last:
         return None
 
-    # Look at the first 3 rows of text combined
-    blob = ' '.join(
-        ' '.join(str(c or '') for c in row) for row in table[:3]
-    ).lower()
-
-    has_name_cols = any(k in blob for k in ('first', 'last', 'name'))
-    has_amount_col = any(k in blob for k in ('cost', 'amount', 'charge', 'premium', 'total'))
-
-    if not (has_name_cols and has_amount_col):
+    # Parse cost — handle parenthesized negative
+    cost_clean = cost_str.replace(',', '').strip()
+    try:
+        cost = float(cost_clean)
+    except ValueError:
         return None
+    # If the original line had the amount in parens, that's a credit
+    if f'({cost_str.lstrip("-")})' in line or f'(${cost_str.lstrip("-")})' in line:
+        cost = -abs(cost)
 
-    has_coverage_month = ('coverage month' in blob) or ('cov month' in blob) \
-        or bool(re.search(r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b[^\n]*\d{4}', blob))
-    is_adjustment = 'adjustment' in blob or has_coverage_month
-
-    if is_adjustment:
-        # Credit vs charge: look for "credit" keyword or negative/parenthesized amounts
-        if 'credit' in blob or 'refund' in blob:
-            return 'adj_credit'
-        # Check for negative amounts in body rows
-        for row in table[1:]:
-            for cell in row:
-                s = str(cell or '')
-                if '(' in s and ')' in s and re.search(r'\d', s):
-                    return 'adj_credit'
-                if s.strip().startswith('-') and re.search(r'\d', s):
-                    return 'adj_credit'
-        return 'adj_charge'
-
-    return 'current'
+    entry = {
+        'firstName': first,
+        'lastName':  last,
+        'tier':      tier,
+        'planCode':  plan,
+        'cost':      cost,
+    }
+    if cov_month is not None:
+        entry['coverageMonth'] = cov_month
+    return entry
 
 
-def _parse_roster_table(table: list, category: str) -> list:
-    """Generic roster table parser. Maps columns by header text."""
-    if not table or len(table) < 2:
-        return []
+def _split_name(name_part: str) -> tuple:
+    """Split a name string into (firstName, lastName)."""
+    name_part = name_part.strip()
+    if not name_part:
+        return ('', '')
 
-    # Find header row = first row with any text
-    header_idx = 0
-    for i, row in enumerate(table):
-        if any(c and str(c).strip() for c in row):
-            header_idx = i
-            break
-    header = [str(c or '').strip().lower() for c in table[header_idx]]
+    # "Last, First M" form
+    if ',' in name_part:
+        parts = [p.strip() for p in name_part.split(',', 1)]
+        last = parts[0]
+        first = parts[1] if len(parts) > 1 else ''
+        return (first, last)
 
-    col_map: dict = {}
-    for i, h in enumerate(header):
-        if 'first' in h and 'name' in h:
-            col_map['firstName'] = i
-        elif 'last' in h and 'name' in h:
-            col_map['lastName'] = i
-        elif h in ('name', 'member name', 'full name', 'employee name', 'member'):
-            col_map.setdefault('fullName', i)
-        elif 'tier' in h:
-            col_map['tier'] = i
-        elif ('plan' in h and ('code' in h or 'sku' in h)) or h == 'sku':
-            col_map['planCode'] = i
-        elif h == 'plan':
-            col_map.setdefault('planCode', i)
-        elif 'coverage' in h or ('month' in h and 'year' not in h):
-            col_map['coverageMonth'] = i
-        elif any(k in h for k in ('cost', 'amount', 'charge', 'credit', 'premium', 'total')):
-            col_map.setdefault('cost', i)
-
-    out = []
-    for row in table[header_idx + 1:]:
-        if not any(c and str(c).strip() for c in row):
-            continue
-
-        first_cell = str(row[0] or '').strip().lower()
-        if first_cell in ('total', 'subtotal', 'grand total', 'sum', 'totals'):
-            continue
-
-        def get(key, default=''):
-            idx = col_map.get(key)
-            if idx is None or idx >= len(row):
-                return default
-            v = row[idx]
-            return str(v or '').strip()
-
-        first = get('firstName')
-        last = get('lastName')
-
-        # Split a combined "full name" cell when no first/last columns exist
-        if not first and not last and 'fullName' in col_map:
-            full = get('fullName')
-            if ',' in full:                       # "Last, First M"
-                parts = [p.strip() for p in full.split(',', 1)]
-                last = parts[0]
-                first = parts[1] if len(parts) > 1 else ''
-            else:                                  # "First Last"
-                parts = full.split(None, 1)
-                first = parts[0] if parts else ''
-                last = parts[1] if len(parts) > 1 else ''
-
-        if not first and not last:
-            continue
-
-        cost_raw = get('cost', '0')
-        cost_clean = cost_raw.replace('$', '').replace(',', '').strip()
-        if cost_clean.startswith('(') and cost_clean.endswith(')'):
-            cost_clean = '-' + cost_clean[1:-1]
-        try:
-            cost = float(cost_clean) if cost_clean else 0.0
-        except ValueError:
-            cost = 0.0
-
-        entry = {
-            'firstName': first,
-            'lastName':  last,
-            'tier':      get('tier'),
-            'planCode':  get('planCode'),
-            'cost':      cost,
-        }
-        if category in ('adj_charge', 'adj_credit'):
-            entry['coverageMonth'] = get('coverageMonth')
-
-        out.append(entry)
-
-    return out
+    # "First Last" or "First Middle Last" — split on first whitespace,
+    # last word is last name, everything before is first (incl. middle).
+    tokens = name_part.split()
+    if len(tokens) == 1:
+        return (tokens[0], '')
+    if len(tokens) == 2:
+        return (tokens[0], tokens[1])
+    # 3+ tokens: First (Middle) Last — put middle into first to keep last clean
+    return (' '.join(tokens[:-1]), tokens[-1])
