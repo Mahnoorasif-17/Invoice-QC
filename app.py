@@ -222,8 +222,9 @@ else:
     # Validation tallies across all groups
     all_validations = [v for r in R for v in r.get('validations', [])]
     v_ok    = sum(1 for v in all_validations if v['status'] == 'ok')
-    v_flag  = sum(1 for v in all_validations if v['status'] == 'flag')
+    v_miss  = sum(1 for v in all_validations if v['status'] == 'missing')
     v_wrong = sum(1 for v in all_validations if v['status'] == 'incorrect')
+    v_no    = sum(1 for v in all_validations if v['status'] == 'no_adj_needed')
 
     st.markdown(
         f'<div style="background:#f0f4ff;border:1px solid #c7d2fe;border-radius:10px;'
@@ -245,11 +246,12 @@ else:
 
     # Adjustment validation summary row
     if all_validations:
-        v1, v2, v3, v4 = st.columns(4)
-        v1.metric("📊 PDF Adjustments", len(all_validations))
-        v2.metric("✅ OK",         v_ok)
-        v3.metric("🟡 Flagged",    v_flag)
-        v4.metric("🔴 Incorrect",  v_wrong)
+        v1, v2, v3, v4, v5 = st.columns(5)
+        v1.metric("📋 Members Reviewed", len(all_validations))
+        v2.metric("✅ OK",            v_ok)
+        v3.metric("🟡 Missing",       v_miss)
+        v4.metric("🔴 Incorrect",     v_wrong)
+        v5.metric("⚪ No Adj Needed", v_no)
 
     f_col, _, reset_col = st.columns([4, 4, 1.5])
     with f_col:
@@ -286,7 +288,7 @@ else:
         else:                 tag, dot = "🟢 CLEAN",    "🟢"
         n_iss = len(g['mi']) + len(g['la'])
         n_val_issues = sum(1 for v in g.get('validations', [])
-                           if v['status'] in ('flag', 'incorrect'))
+                           if v['status'] in ('missing', 'incorrect'))
         amt = g.get('invoiceAmount') or 0
         title = (f"{dot}  {g.get('groupName') or 'Unknown'}  "
                  f"·  {g.get('groupId') or '—'}  ·  ${amt:,.0f}")
@@ -345,37 +347,69 @@ else:
             vals = g.get('validations', [])
             if vals:
                 st.markdown("##### 📋 Adjustments & Credits — Excel ↔ PDF Validation")
-                st.caption(
-                    "Excel is the source of truth. **OK** = PDF matches Excel · "
-                    "**FLAG** = Excel predicts this adjustment but PDF is missing it · "
-                    "**INCORRECT** = PDF has an entry that contradicts Excel."
-                )
 
                 ok_n    = sum(1 for v in vals if v['status'] == 'ok')
-                fl_n    = sum(1 for v in vals if v['status'] == 'flag')
+                miss_n  = sum(1 for v in vals if v['status'] == 'missing')
                 wrong_n = sum(1 for v in vals if v['status'] == 'incorrect')
-                st.caption(f"✅ {ok_n} OK · 🟡 {fl_n} flagged · 🔴 {wrong_n} incorrect")
+                no_n    = sum(1 for v in vals if v['status'] == 'no_adj_needed')
 
+                # Mini-stats row
+                s1, s2, s3, s4 = st.columns(4)
+                s1.markdown(f'<div style="background:#dcfce7;padding:8px 12px;'
+                            f'border-radius:6px;text-align:center;">'
+                            f'<div style="font-size:11px;color:#166534;font-weight:600;">✅ OK</div>'
+                            f'<div style="font-size:22px;font-weight:700;color:#166534;">{ok_n}</div>'
+                            f'</div>', unsafe_allow_html=True)
+                s2.markdown(f'<div style="background:#fef3c7;padding:8px 12px;'
+                            f'border-radius:6px;text-align:center;">'
+                            f'<div style="font-size:11px;color:#b45309;font-weight:600;">🟡 MISSING</div>'
+                            f'<div style="font-size:22px;font-weight:700;color:#b45309;">{miss_n}</div>'
+                            f'</div>', unsafe_allow_html=True)
+                s3.markdown(f'<div style="background:#fee2e2;padding:8px 12px;'
+                            f'border-radius:6px;text-align:center;">'
+                            f'<div style="font-size:11px;color:#991b1b;font-weight:600;">🔴 INCORRECT</div>'
+                            f'<div style="font-size:22px;font-weight:700;color:#991b1b;">{wrong_n}</div>'
+                            f'</div>', unsafe_allow_html=True)
+                s4.markdown(f'<div style="background:#f3f4f6;padding:8px 12px;'
+                            f'border-radius:6px;text-align:center;">'
+                            f'<div style="font-size:11px;color:#374151;font-weight:600;">⚪ NO ADJ NEEDED</div>'
+                            f'<div style="font-size:22px;font-weight:700;color:#374151;">{no_n}</div>'
+                            f'</div>', unsafe_allow_html=True)
+                st.write("")
+
+                # Build a unified table — one row per member
                 v_df = pd.DataFrame([{
-                    'Status':   {'ok': '✅ OK', 'flag': '🟡 FLAG',
-                                 'incorrect': '🔴 INCORRECT'}[v['status']],
-                    'Type':     v['type'],
-                    'Member':   v['name'],
-                    'Coverage Month': v['month'],
-                    'Plan':     v.get('plan', '') or v.get('planCode', ''),
-                    'Amount':   f"${abs(v['cost']):,.2f}" + (' (cr)' if v['type'] == 'Credit' else ''),
-                    'Reason':   v['reason'],
+                    'Status': {
+                        'ok':            '✅ OK',
+                        'missing':       '🟡 MISSING',
+                        'incorrect':     '🔴 INCORRECT',
+                        'no_adj_needed': '⚪ NO ADJ NEEDED',
+                    }[v['status']],
+                    'Member':  v['name'],
+                    'Type':    v['type'],
+                    'Months':  v['months'],
+                    'Plan':    v.get('plan', '') or v.get('planCode', ''),
+                    'Amount':  f"${abs(v.get('cost') or 0):,.2f}" if v.get('cost') else '—',
+                    'Reason':  v['reason'],
                 } for v in vals])
 
                 def _row_color(row):
                     if row['Status'].startswith('🔴'): bg = '#fee2e2'
                     elif row['Status'].startswith('🟡'): bg = '#fef3c7'
-                    else: bg = '#dcfce7'
+                    elif row['Status'].startswith('✅'): bg = '#dcfce7'
+                    else: bg = '#f3f4f6'  # no_adj_needed
                     return [f'background-color: {bg}'] * len(row)
 
                 st.dataframe(
                     v_df.style.apply(_row_color, axis=1),
                     use_container_width=True, hide_index=True,
+                )
+
+                st.caption(
+                    "💡 **Legend** — **OK**: PDF matches Excel · "
+                    "**MISSING**: Excel expects adjustment but PDF doesn't have it · "
+                    "**INCORRECT**: PDF entry contradicts Excel · "
+                    "**NO ADJ NEEDED**: Member is in data window but no adjustment required."
                 )
 
             if g['isClean'] and not g['la'] and not vals:
@@ -422,15 +456,15 @@ else:
     for g in R:
         for v in g.get('validations', []):
             valid_rows.append({
-                'Group ID':       g['groupId'],
-                'Group Name':     g['groupName'],
-                'Member':         v['name'],
+                'Group ID':        g['groupId'],
+                'Group Name':      g['groupName'],
+                'Member':          v['name'],
                 'Adjustment Type': v['type'],
-                'Coverage Month': v['month'],
-                'Plan':           v.get('plan', '') or v.get('planCode', ''),
-                'Amount':         v['cost'],
-                'Status':         v['status'].upper(),
-                'Reason':         v['reason'],
+                'Months':          v.get('months', ''),
+                'Plan':            v.get('plan', ''),
+                'Amount':          v.get('cost') or 0,
+                'Status':          v['status'].upper(),
+                'Reason':          v['reason'],
             })
 
     e_col1, e_col2 = st.columns(2)

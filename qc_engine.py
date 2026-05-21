@@ -1,28 +1,36 @@
 """
 QC Engine — Excel is the source of truth.
 
-Two separate concerns now:
+BILLING RULES (1-4): walk Excel rows, flag billing problems.
+ADJUSTMENT / CREDIT VALIDATION: per-member, with these rules:
 
-  1. BILLING issues (run_qc → member_issues)
-     Rules 1-4: terminated/billed, active/not-billed, future-start/billed,
-     SKU mismatch / PEPM. These are Excel-internal + Excel-vs-PDF-billing checks.
+  ── Did anything fall in the data window? ───
+  A member is "in scope" for adjustment validation if EITHER:
+    • EnrolledOn is in the data window  → expect charges for past months they started
+    • EndedOn    is in the data window  → expect credits for months billed AFTER end
 
-  2. ADJUSTMENT/CREDIT validation (validate_adjustments → validations)
-     Unified Excel→PDF report. Three statuses:
-       - ok        : Excel predicted this adjustment AND PDF has it
-       - flag      : Excel predicted this adjustment but PDF is MISSING it,
-                     OR a PDF entry is suspicious (can't parse month, etc.)
-       - incorrect : PDF has an adjustment that contradicts Excel
-                     (wrong member, before start date, after end date, etc.)
+  ── Credits ───
+  • EndDate in any past month → NO credit needed for that end month
+    (member used some insurance that month → full month billed → no credit owed)
+  • But credit IS needed for any month billed AFTER the end month
+    (e.g. EndDate Feb 28 → no credit for Feb, but credits needed for Mar, Apr if billed)
 
-There is NO duplication — Rules 5 and 6 from the old version (which lived in
-member_issues) are gone. All adjustment logic is now in validate_adjustments().
+  ── Charges ───
+  • StartDate in any past month + EnrolledOn in data window → charge needed for
+    every month from start month through invoice_month−1 inclusive.
+
+Per-member verdict (one row in the report):
+  • OK            → all expected adjustments are in the PDF
+  • NO_ADJ_NEEDED → in scope (data window) but no adjustments needed AND PDF has none
+  • MISSING       → expected some adjustments, but PDF is missing one or more
+  • INCORRECT     → PDF has entries that contradict Excel (wrong member, before
+                    start, after end+1month, etc.)
 """
 
 import calendar
 import re
 from datetime import datetime
-from typing import Optional, Any
+from typing import Optional, Any, List, Dict
 import pandas as pd
 
 MN = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
@@ -106,13 +114,7 @@ def month_floor(d: datetime) -> datetime:
     return datetime(d.year, d.month, 1)
 
 
-def is_last_day_of_month(d: datetime) -> bool:
-    """True if d is the last calendar day of its month (e.g. Apr 30, Feb 28/29)."""
-    return d.day == calendar.monthrange(d.year, d.month)[1]
-
-
 def next_month(d: datetime) -> datetime:
-    """Return the 1st of the month after d."""
     if d.month == 12:
         return datetime(d.year + 1, 1, 1)
     return datetime(d.year, d.month + 1, 1)
@@ -161,8 +163,7 @@ def build_context(invoice_month: int, invoice_year: int) -> dict:
 
 
 # ────────────────────────────────────────────────────────────────────
-# MAIN QC — BILLING RULES (1-4) ONLY
-# Adjustment/credit handling is delegated to validate_adjustments below.
+# MAIN QC — BILLING RULES (1-4)
 # ────────────────────────────────────────────────────────────────────
 def run_qc(rows: list, pdf_data: dict, ctx: dict) -> dict:
     member_issues = []
@@ -217,7 +218,7 @@ def run_qc(rows: list, pdf_data: dict, ctx: dict) -> dict:
         if issues:
             member_issues.append({'name': name or '(no name)', 'iss': issues})
 
-    # Late adjustments (older than 60-day boundary) — for the approval section
+    # Late adjustments (older than 60-day boundary) — listed separately
     late_adj = []
     for r in (pdf_data.get('adjustmentChargeRoster') or []):
         d = parse_month_string(r.get('coverageMonth'))
@@ -234,8 +235,8 @@ def run_qc(rows: list, pdf_data: dict, ctx: dict) -> dict:
                 'type': 'Credit', 'month': r.get('coverageMonth', ''),
                 'cost': to_float(r.get('cost')) or 0, 'plan': r.get('planCode', '')})
 
-    # Adjustment/credit validation (the new unified report)
-    validations = validate_adjustments(rows, pdf_data, ctx)
+    # Adjustment/credit validation — per-member report
+    validations = validate_adjustments_per_member(rows, pdf_data, ctx)
 
     has_errors = any(any(i['sev'] == 'error' for i in m['iss']) for m in member_issues)
     has_warnings = any(any(i['sev'] in ('warning', 'pepm', 'approval') for i in m['iss'])
@@ -244,7 +245,7 @@ def run_qc(rows: list, pdf_data: dict, ctx: dict) -> dict:
     # Roll validation outcomes into overall status
     if any(v['status'] == 'incorrect' for v in validations):
         has_errors = True
-    if any(v['status'] == 'flag' for v in validations):
+    if any(v['status'] == 'missing' for v in validations):
         has_warnings = True
 
     return {
@@ -264,30 +265,27 @@ def run_qc(rows: list, pdf_data: dict, ctx: dict) -> dict:
 
 
 # ────────────────────────────────────────────────────────────────────
-# ADJUSTMENT/CREDIT VALIDATION — EXCEL → PDF, UNIFIED REPORT
+# ADJUSTMENT/CREDIT VALIDATION — PER MEMBER (one row each)
 # ────────────────────────────────────────────────────────────────────
-def validate_adjustments(rows: list, pdf_data: dict, ctx: dict) -> list:
+def validate_adjustments_per_member(rows: list, pdf_data: dict, ctx: dict) -> list:
     """
-    Returns a list of validation entries, each with:
-        status   : 'ok' | 'flag' | 'incorrect'
-        type     : 'Charge' | 'Credit'
-        name     : member name
-        month    : coverage month string
-        cost     : amount
-        plan     : plan code
-        reason   : human-readable explanation
-
-    Two passes:
-      Pass A (Excel → PDF): For each member, derive expected adjustments from
-                            their Excel dates. Match against PDF entries.
-                            Match  = OK.   Missing = FLAG.
-      Pass B (PDF → Excel): For each PDF entry not matched in Pass A, validate
-                            against Excel. Unmatched but valid = FLAG.
-                            Contradicts Excel = INCORRECT.
+    Returns one validation entry per relevant member, each shaped like:
+      {
+        'status':    'ok' | 'missing' | 'incorrect' | 'no_adj_needed',
+        'type':      'Charge' | 'Credit' | 'Charge & Credit' | 'None',
+        'name':      'First Last',
+        'months':    'Mar 2026, Apr 2026'   ← all expected months joined
+        'expected':  ['Mar 2026', 'Apr 2026'],
+        'found':     ['Mar 2026'],
+        'missing':   ['Apr 2026'],
+        'cost':      total amount expected (sum)
+        'plan':      plan code from Excel
+        'reason':    human-readable explanation
+      }
     """
     # Index PDF entries by normalized name
-    pdf_charges_by_name = {}  # nk -> list[(month_dt|None, raw_row)]
-    pdf_credits_by_name = {}
+    pdf_charges_by_name: Dict[str, list] = {}
+    pdf_credits_by_name: Dict[str, list] = {}
     for r in (pdf_data.get('adjustmentChargeRoster') or []):
         nk = normalize_name(str(r.get('firstName', '')) + str(r.get('lastName', '')))
         pdf_charges_by_name.setdefault(nk, []).append(
@@ -297,11 +295,12 @@ def validate_adjustments(rows: list, pdf_data: dict, ctx: dict) -> list:
         pdf_credits_by_name.setdefault(nk, []).append(
             (parse_month_string(r.get('coverageMonth')), r))
 
-    # Track which PDF entries were matched to an Excel expectation
-    matched_charges, matched_credits = set(), set()  # set of id() of raw_row
+    # Track matched PDF rows so we can detect unexpected leftovers
+    matched_charge_ids = set()
+    matched_credit_ids = set()
 
     # Excel lookup
-    name_to_row = {}
+    name_to_row: Dict[str, dict] = {}
     for row in rows:
         fn = str(row.get('FirstName') or '').strip()
         ln = str(row.get('LastName') or '').strip()
@@ -309,174 +308,264 @@ def validate_adjustments(rows: list, pdf_data: dict, ctx: dict) -> list:
         if nk:
             name_to_row[nk] = row
 
-    validations = []
+    validations: List[dict] = []
 
-    # ── PASS A: Excel-driven expectations ───────────────────────────
+    # ─── PASS A: Walk every Excel member in scope ────────────────────
     for row in rows:
         fn = str(row.get('FirstName') or '').strip()
         ln = str(row.get('LastName') or '').strip()
         name = f"{fn} {ln}".strip() or '(no name)'
         nk = normalize_name(fn + ln)
+        plan = str(row.get('CarrierPlanCode') or '').strip()
+        plan_cost = to_float(row.get('PlanCost')) or 0
 
-        st = str(row.get('EmploymentStatus') or '').strip()
         sd = parse_date(row.get('StartDate'))
         eo = parse_date(row.get('EnrolledOn'))
         ed = parse_date(row.get('EndDate'))
         on = parse_date(row.get('EndedOn'))
-        plan = str(row.get('CarrierPlanCode') or '').strip()
-        plan_cost = to_float(row.get('PlanCost')) or 0
+        st = str(row.get('EmploymentStatus') or '').strip()
 
-        # ── Expected adjustment CHARGES: enrolled in data window AND start
-        #    month is BEFORE the invoice month. Predict ONE charge per missed
-        #    month — from start_month through (invoice_month − 1) inclusive.
-        if eo and in_window(eo, ctx['windowStart'], ctx['windowEnd']) \
-                and st == 'Active' and sd:
+        eo_in_window = eo is not None and in_window(eo, ctx['windowStart'], ctx['windowEnd'])
+        on_in_window = on is not None and in_window(on, ctx['windowStart'], ctx['windowEnd'])
+
+        # Skip members who aren't relevant — neither enroll nor end fell in the data window
+        if not eo_in_window and not on_in_window:
+            continue
+
+        # ── Build the list of expected CHARGES ────────────────────────
+        expected_charge_months: List[datetime] = []
+        if eo_in_window and st == 'Active' and sd:
             sd_month = month_floor(sd)
             if sd_month < ctx['invoiceStart']:
-                for predicted_m in months_between(sd_month, ctx['invoiceStart']):
-                    # Find unmatched PDF charge for this exact month
-                    found_row = None
-                    for m, r in pdf_charges_by_name.get(nk, []):
-                        if m == predicted_m and id(r) not in matched_charges:
-                            found_row = r
-                            matched_charges.add(id(r))
-                            break
+                # Charge needed for every month from start through invoice_month-1
+                for m in months_between(sd_month, ctx['invoiceStart']):
+                    expected_charge_months.append(m)
 
-                    if found_row is not None:
-                        validations.append({
-                            'status': 'ok',
-                            'type':   'Charge',
-                            'name':   name,
-                            'month':  format_month(predicted_m),
-                            'cost':   to_float(found_row.get('cost')) or 0,
-                            'plan':   str(found_row.get('planCode', '') or ''),
-                            'reason': (f"Expected (enrolled {eo.strftime('%m/%d/%Y')}, "
-                                       f"start {sd.strftime('%m/%d/%Y')}) — found in PDF"),
-                        })
-                    else:
-                        needs_appr = predicted_m < ctx['boundary60']
-                        suffix = ' — NEEDS APPROVAL (>60 days)' if needs_appr else ''
-                        validations.append({
-                            'status': 'flag',
-                            'type':   'Charge',
-                            'name':   name,
-                            'month':  format_month(predicted_m),
-                            'cost':   plan_cost,
-                            'plan':   plan,
-                            'reason': (f"MISSING — enrolled {eo.strftime('%m/%d/%Y')} (data window), "
-                                       f"start {sd.strftime('%m/%d/%Y')} → expected charge for "
-                                       f"{format_month(predicted_m)} but PDF has none{suffix}"),
-                        })
-
-        # ── Expected CREDIT: ended in data window AND end month is BEFORE
-        #    the invoice month (in-month ends are covered by regular billing).
-        #    ALSO skip if end date is the LAST day of its month — the full
-        #    month was earned, so no credit is owed.
-        if on and in_window(on, ctx['windowStart'], ctx['windowEnd']) and ed:
+        # ── Build the list of expected CREDITS ────────────────────────
+        # Rule: NO credit for the end month itself (any day = used insurance,
+        # full month billed).  Credit IS needed for any month billed AFTER
+        # the end month — i.e. (end_month + 1) through (invoice_month − 1).
+        expected_credit_months: List[datetime] = []
+        if on_in_window and ed:
             ed_month = month_floor(ed)
-            if ed_month < ctx['invoiceStart'] and not is_last_day_of_month(ed):
-                found_row = None
-                for m, r in pdf_credits_by_name.get(nk, []):
-                    if m == ed_month and id(r) not in matched_credits:
-                        found_row = r
-                        matched_credits.add(id(r))
-                        break
+            first_credit_month = next_month(ed_month)
+            if first_credit_month < ctx['invoiceStart']:
+                for m in months_between(first_credit_month, ctx['invoiceStart']):
+                    expected_credit_months.append(m)
 
-                if found_row is not None:
-                    validations.append({
-                        'status': 'ok',
-                        'type':   'Credit',
-                        'name':   name,
-                        'month':  format_month(ed_month),
-                        'cost':   to_float(found_row.get('cost')) or 0,
-                        'plan':   str(found_row.get('planCode', '') or ''),
-                        'reason': (f"Expected (ended {ed.strftime('%m/%d/%Y')}, "
-                                   f"entered EN {on.strftime('%m/%d/%Y')}) — found in PDF"),
-                    })
+        # ── Match PDF entries to expectations ─────────────────────────
+        found_charges: List[datetime] = []
+        missing_charges: List[datetime] = []
+        for em in expected_charge_months:
+            matched = None
+            for m, r in pdf_charges_by_name.get(nk, []):
+                if m == em and id(r) not in matched_charge_ids:
+                    matched = r
+                    matched_charge_ids.add(id(r))
+                    break
+            (found_charges if matched else missing_charges).append(em)
+
+        found_credits: List[datetime] = []
+        missing_credits: List[datetime] = []
+        for em in expected_credit_months:
+            matched = None
+            for m, r in pdf_credits_by_name.get(nk, []):
+                if m == em and id(r) not in matched_credit_ids:
+                    matched = r
+                    matched_credit_ids.add(id(r))
+                    break
+            (found_credits if matched else missing_credits).append(em)
+
+        # ── Detect unexpected PDF entries for this member ─────────────
+        # Any PDF charge/credit for this person that doesn't match an
+        # expected month is suspicious. We'll classify it here too so the
+        # per-member row owns its full verdict.
+        unexpected_pdf: List[dict] = []
+        for m, r in pdf_charges_by_name.get(nk, []):
+            if id(r) in matched_charge_ids:
+                continue
+            unexpected_pdf.append({
+                'kind': 'Charge', 'month_dt': m, 'row': r,
+                'month_str': str(r.get('coverageMonth', '') or '?'),
+                'cost': to_float(r.get('cost')) or 0,
+            })
+            matched_charge_ids.add(id(r))  # mark consumed so Pass B skips
+        for m, r in pdf_credits_by_name.get(nk, []):
+            if id(r) in matched_credit_ids:
+                continue
+            unexpected_pdf.append({
+                'kind': 'Credit', 'month_dt': m, 'row': r,
+                'month_str': str(r.get('coverageMonth', '') or '?'),
+                'cost': to_float(r.get('cost')) or 0,
+            })
+            matched_credit_ids.add(id(r))
+
+        # ── Decide the per-member verdict ─────────────────────────────
+        has_expected = bool(expected_charge_months or expected_credit_months)
+        has_missing = bool(missing_charges or missing_credits)
+        has_unexpected = bool(unexpected_pdf)
+
+        # Build label parts
+        type_parts = []
+        if expected_charge_months or any(u['kind'] == 'Charge' for u in unexpected_pdf):
+            type_parts.append('Charge')
+        if expected_credit_months or any(u['kind'] == 'Credit' for u in unexpected_pdf):
+            type_parts.append('Credit')
+        type_label = ' & '.join(type_parts) if type_parts else 'None'
+
+        # Build month list
+        all_months = (
+            [format_month(m) for m in (expected_charge_months + expected_credit_months)]
+            + [u['month_str'] for u in unexpected_pdf]
+        )
+        months_str = ', '.join(all_months) if all_months else '—'
+
+        # ── Status decision tree ──────────────────────────────────────
+        if has_unexpected:
+            # Validate each unexpected entry against employment dates
+            problem_reasons = []
+            for u in unexpected_pdf:
+                m = u['month_dt']
+                if m is None:
+                    problem_reasons.append(
+                        f"Could not parse PDF coverage month {u['month_str']!r}")
+                    continue
+                if sd and m < month_floor(sd):
+                    problem_reasons.append(
+                        f"PDF has {u['kind']} for {format_month(m)} "
+                        f"but member started {sd.strftime('%m/%d/%Y')}")
+                elif ed and m > month_floor(ed) and u['kind'] == 'Charge':
+                    problem_reasons.append(
+                        f"PDF has {u['kind']} for {format_month(m)} "
+                        f"but member ended {ed.strftime('%m/%d/%Y')}")
+                elif u['kind'] == 'Credit' and not ed:
+                    problem_reasons.append(
+                        f"PDF has Credit for {format_month(m)} "
+                        f"but member has no end date in Excel")
                 else:
-                    needs_appr = ed_month < ctx['boundary60']
-                    suffix = ' — NEEDS APPROVAL (>60 days)' if needs_appr else ''
-                    validations.append({
-                        'status': 'flag',
-                        'type':   'Credit',
-                        'name':   name,
-                        'month':  format_month(ed_month),
-                        'cost':   plan_cost,
-                        'plan':   plan,
-                        'reason': (f"MISSING — ended {ed.strftime('%m/%d/%Y')}, entered EN "
-                                   f"{on.strftime('%m/%d/%Y')} (data window) → expected credit "
-                                   f"for {format_month(ed_month)} but PDF has none{suffix}"),
-                    })
+                    problem_reasons.append(
+                        f"PDF has unexpected {u['kind']} for {format_month(m)}")
+            status = 'incorrect'
+            reason = '; '.join(problem_reasons)
 
-    # ── PASS B: PDF entries not matched in Pass A ───────────────────
-    def _classify_pdf_entry(nk: str, m: Optional[datetime], r: dict, kind: str) -> dict:
-        full_name = f"{r.get('firstName', '')} {r.get('lastName', '')}".strip() or '(no name)'
-        cov_str = str(r.get('coverageMonth', '') or '')
-        cost = to_float(r.get('cost')) or 0
-        plan = str(r.get('planCode', '') or '')
+        elif has_missing:
+            parts = []
+            if missing_charges:
+                parts.append(f"Missing Charge(s) for {', '.join(format_month(m) for m in missing_charges)}")
+            if missing_credits:
+                parts.append(f"Missing Credit(s) for {', '.join(format_month(m) for m in missing_credits)}")
+            # Note approval requirements
+            approval_months = [m for m in (missing_charges + missing_credits) if m < ctx['boundary60']]
+            if approval_months:
+                parts.append(f"NEEDS APPROVAL — older than 60 days")
+            status = 'missing'
+            reason = '; '.join(parts)
 
-        base = {'type': kind, 'name': full_name,
-                'month': cov_str or '?', 'cost': cost, 'plan': plan}
+        elif has_expected:
+            # Everything expected was found
+            parts = []
+            if eo_in_window:
+                parts.append(f"enrolled {eo.strftime('%m/%d/%Y')}")
+            if on_in_window:
+                parts.append(f"entered EN {on.strftime('%m/%d/%Y')}")
+            if sd:
+                parts.append(f"start {sd.strftime('%m/%d/%Y')}")
+            if ed:
+                parts.append(f"end {ed.strftime('%m/%d/%Y')}")
+            status = 'ok'
+            reason = f"All expected adjustments found in PDF ({', '.join(parts)})"
 
-        # Member not in Excel → INCORRECT
-        if nk not in name_to_row:
-            return {**base, 'status': 'incorrect',
-                    'reason': f'Member not found in Excel roster — PDF has {kind.lower()} '
-                              f'but no record exists'}
+        else:
+            # In data window, but nothing should have been adjusted
+            # AND nothing unexpected in PDF → NO ADJ NEEDED
+            reasons = []
+            if eo_in_window and (not sd or month_floor(sd) >= ctx['invoiceStart']):
+                if sd:
+                    reasons.append(f"enrolled {eo.strftime('%m/%d/%Y')} but start "
+                                   f"{sd.strftime('%m/%d/%Y')} is in invoice month — "
+                                   f"regular billing covers")
+                else:
+                    reasons.append(f"enrolled {eo.strftime('%m/%d/%Y')} but no start date")
+            if on_in_window and ed and month_floor(ed) < ctx['invoiceStart']:
+                # End in past month, no month billed after end → no credit needed
+                reasons.append(f"ended {ed.strftime('%m/%d/%Y')} — used insurance that month, "
+                               f"no credit needed")
+            if on_in_window and ed and month_floor(ed) >= ctx['invoiceStart']:
+                reasons.append(f"ended {ed.strftime('%m/%d/%Y')} — in invoice month, "
+                               f"regular billing covers")
+            status = 'no_adj_needed'
+            reason = '; '.join(reasons) if reasons else 'In data window but no adjustments needed'
 
-        # Couldn't parse coverage month → FLAG
-        if m is None:
-            return {**base, 'status': 'flag',
-                    'reason': f'Could not parse coverage month: "{cov_str}"'}
+        # ── Compute total expected amount and unmatched-entry details
+        expected_amount = (
+            (len(expected_charge_months) * plan_cost)
+            + sum(abs(u['cost']) for u in unexpected_pdf if u['kind'] == 'Charge')
+        )
+        # For credits we keep signed
+        validations.append({
+            'status':   status,
+            'type':     type_label,
+            'name':     name,
+            'months':   months_str,
+            'expected_charges': [format_month(m) for m in expected_charge_months],
+            'expected_credits': [format_month(m) for m in expected_credit_months],
+            'found_charges':    [format_month(m) for m in found_charges],
+            'found_credits':    [format_month(m) for m in found_credits],
+            'missing_charges':  [format_month(m) for m in missing_charges],
+            'missing_credits':  [format_month(m) for m in missing_credits],
+            'unexpected_pdf':   [{'kind': u['kind'], 'month': u['month_str'],
+                                  'cost': u['cost']} for u in unexpected_pdf],
+            'cost':     expected_amount,
+            'plan':     plan,
+            'reason':   reason,
+        })
 
-        emp = name_to_row[nk]
-        sd = parse_date(emp.get('StartDate'))
-        ed = parse_date(emp.get('EndDate'))
-
-        if sd is None:
-            return {**base, 'status': 'flag',
-                    'reason': 'No start date in Excel — cannot verify'}
-
-        sd_month = month_floor(sd)
-
-        # Coverage before start → INCORRECT
-        if m < sd_month:
-            return {**base, 'status': 'incorrect',
-                    'reason': (f'Coverage month {format_month(m)} is before start date '
-                               f'{sd.strftime("%m/%d/%Y")}')}
-
-        # Coverage after end → INCORRECT
-        if ed is not None and m > month_floor(ed):
-            return {**base, 'status': 'incorrect',
-                    'reason': (f'Coverage month {format_month(m)} is after end date '
-                               f'{ed.strftime("%m/%d/%Y")}')}
-
-        # For credits: member should have an end date
-        if kind == 'Credit' and ed is None:
-            return {**base, 'status': 'flag',
-                    'reason': 'Credit in PDF but member has no end date in Excel'}
-
-        # Within employment period but Excel didn't predict it — FLAG with note
-        return {**base, 'status': 'flag',
-                'reason': (f'Within employment period but not predicted by data window — '
-                           f'review (started {sd.strftime("%m/%d/%Y")}'
-                           + (f', ended {ed.strftime("%m/%d/%Y")}' if ed else '')
-                           + ')')}
-
+    # ─── PASS B: PDF entries that didn't match any Excel member ──────
+    # These are members in the PDF but not in Excel — INCORRECT
+    pdf_only_members: Dict[str, List[dict]] = {}
     for nk, entries in pdf_charges_by_name.items():
-        for m, r in entries:
-            if id(r) in matched_charges:
-                continue
-            validations.append(_classify_pdf_entry(nk, m, r, 'Charge'))
-
+        if nk not in name_to_row:
+            for m, r in entries:
+                pdf_only_members.setdefault(nk, []).append({
+                    'kind': 'Charge', 'month_dt': m, 'row': r,
+                    'month_str': str(r.get('coverageMonth', '') or '?'),
+                    'cost': to_float(r.get('cost')) or 0,
+                })
     for nk, entries in pdf_credits_by_name.items():
-        for m, r in entries:
-            if id(r) in matched_credits:
-                continue
-            validations.append(_classify_pdf_entry(nk, m, r, 'Credit'))
+        if nk not in name_to_row:
+            for m, r in entries:
+                pdf_only_members.setdefault(nk, []).append({
+                    'kind': 'Credit', 'month_dt': m, 'row': r,
+                    'month_str': str(r.get('coverageMonth', '') or '?'),
+                    'cost': to_float(r.get('cost')) or 0,
+                })
 
-    # Sort: incorrect first, then flag, then ok
-    sort_order = {'incorrect': 0, 'flag': 1, 'ok': 2}
-    validations.sort(key=lambda v: (sort_order[v['status']], v['type'], v['name']))
+    for nk, entries in pdf_only_members.items():
+        # Reconstruct name from the PDF rows
+        sample = entries[0]['row']
+        name = f"{sample.get('firstName', '')} {sample.get('lastName', '')}".strip() or '(no name)'
+        type_parts = sorted({e['kind'] for e in entries})
+        type_label = ' & '.join(type_parts)
+        months_str = ', '.join(e['month_str'] for e in entries)
+        plan = str(sample.get('planCode', '') or '')
+
+        validations.append({
+            'status':   'incorrect',
+            'type':     type_label,
+            'name':     name,
+            'months':   months_str,
+            'expected_charges': [], 'expected_credits': [],
+            'found_charges':    [], 'found_credits':    [],
+            'missing_charges':  [], 'missing_credits':  [],
+            'unexpected_pdf':   [{'kind': e['kind'], 'month': e['month_str'],
+                                  'cost': e['cost']} for e in entries],
+            'cost':     sum(abs(e['cost']) for e in entries),
+            'plan':     plan,
+            'reason':   f"Member not found in Excel roster — PDF has {type_label.lower()} entries",
+        })
+
+    # Sort: incorrect first, then missing, then ok, then no_adj_needed
+    sort_order = {'incorrect': 0, 'missing': 1, 'ok': 2, 'no_adj_needed': 3}
+    validations.sort(key=lambda v: (sort_order[v['status']], v['name']))
 
     return validations
