@@ -130,16 +130,26 @@ def _find_current_period_amount(text: str) -> Optional[float]:
 
 
 def _find_adj_total(text: str, kind: str) -> Optional[float]:
-    """kind = 'Charges' or 'Credits'."""
+    """kind = 'Charges' or 'Credits'. Handles parenthesized credits."""
+    # Pattern allows either ( ... ) wrapping or - prefix
+    cost = r'\(?\s*\$?\s*(-?[\d,]+\.?\d*)\s*\)?'
     for pat in (
-        rf'Total\s+Adjustments\s*[-\u2013]\s*{kind}\s*:?\s*\$?\s*\(?(-?[\d,]+\.?\d*)\)?',
-        rf'TOTAL\s+ADJUSTMENTS\s*[-\u2013]\s*{kind.upper()}\s*:?\s*\$?\s*\(?(-?[\d,]+\.?\d*)\)?',
-        rf'Adjustments?\s*[-\u2013]\s*{kind}\s+Total\s*:?\s*\$?\s*\(?(-?[\d,]+\.?\d*)\)?',
+        rf'Total\s+Adjustments\s*[-\u2013]\s*{kind}\s*:?\s*{cost}',
+        rf'TOTAL\s+ADJUSTMENTS\s*[-\u2013]\s*{kind.upper()}\s*:?\s*{cost}',
+        rf'Adjustments?\s*[-\u2013]\s*{kind}\s+Total\s*:?\s*{cost}',
     ):
         m = re.search(pat, text, re.IGNORECASE)
         if m:
             val = _to_number(m.group(1))
-            return -abs(val) if kind == 'Credits' and val and val > 0 else val
+            if val is None:
+                continue
+            # Check if the matched text had parentheses → negative
+            matched_text = m.group(0)
+            if '(' in matched_text and ')' in matched_text:
+                val = -abs(val)
+            elif kind == 'Credits' and val > 0:
+                val = -abs(val)
+            return val
     return None
 
 
@@ -224,9 +234,12 @@ def _parse_roster_row(line: str, has_coverage_month: bool) -> Optional[dict]:
 
     Token order (last to first):
       [cost] [coverage_month?] [plan_code] [tier] [...name...]
+
+    Cost token handles: $123.45, 123.45, ($123.45), (123.45), -123.45
+    Parenthesized = credit (negative).
     """
-    # Pattern for cost: $123.45 or 123.45 or (123.45) or -123.45
-    cost_pattern = r'\$?\s*\(?(-?[\d,]+\.\d{2})\)?'
+    # Cost pattern — order matters: optional (, optional $, digits, optional )
+    cost_pattern = r'\(?\s*\$?\s*(-?[\d,]+\.\d{2})\s*\)?'
 
     if has_coverage_month:
         # Coverage month looks like "Mar-2026", "January 2026", "Mar 2026"
@@ -254,15 +267,20 @@ def _parse_roster_row(line: str, has_coverage_month: bool) -> Optional[dict]:
     if not first and not last:
         return None
 
-    # Parse cost — handle parenthesized negative
+    # Parse cost
     cost_clean = cost_str.replace(',', '').strip()
     try:
         cost = float(cost_clean)
     except ValueError:
         return None
-    # If the original line had the amount in parens, that's a credit
-    if f'({cost_str.lstrip("-")})' in line or f'(${cost_str.lstrip("-")})' in line:
-        cost = -abs(cost)
+
+    # Detect credit via parentheses or leading minus in the original line tail
+    # Find the part of the line that contains the cost, check for ( ... )
+    cost_idx = line.rfind(cost_str)
+    if cost_idx > 0:
+        tail = line[cost_idx - 2:cost_idx + len(cost_str) + 2]
+        if '(' in tail and ')' in tail:
+            cost = -abs(cost)
 
     entry = {
         'firstName': first,

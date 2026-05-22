@@ -224,6 +224,7 @@ else:
     v_ok    = sum(1 for v in all_validations if v['status'] == 'ok')
     v_miss  = sum(1 for v in all_validations if v['status'] == 'missing')
     v_wrong = sum(1 for v in all_validations if v['status'] == 'incorrect')
+    v_unex  = sum(1 for v in all_validations if v['status'] == 'unexplained')
     v_no    = sum(1 for v in all_validations if v['status'] == 'no_adj_needed')
 
     st.markdown(
@@ -246,12 +247,13 @@ else:
 
     # Adjustment validation summary row
     if all_validations:
-        v1, v2, v3, v4, v5 = st.columns(5)
-        v1.metric("📋 Members Reviewed", len(all_validations))
-        v2.metric("✅ OK",            v_ok)
-        v3.metric("🟡 Missing",       v_miss)
-        v4.metric("🔴 Incorrect",     v_wrong)
-        v5.metric("⚪ No Adj Needed", v_no)
+        v1, v2, v3, v4, v5, v6 = st.columns(6)
+        v1.metric("📋 Members",         len(all_validations))
+        v2.metric("✅ OK",               v_ok)
+        v3.metric("🟡 Missing",          v_miss)
+        v4.metric("🔴 Incorrect",        v_wrong)
+        v5.metric("❓ Unexplained",      v_unex)
+        v6.metric("⚪ No Adj Needed",    v_no)
 
     f_col, _, reset_col = st.columns([4, 4, 1.5])
     with f_col:
@@ -288,7 +290,7 @@ else:
         else:                 tag, dot = "🟢 CLEAN",    "🟢"
         n_iss = len(g['mi']) + len(g['la'])
         n_val_issues = sum(1 for v in g.get('validations', [])
-                           if v['status'] in ('missing', 'incorrect'))
+                           if v['status'] in ('missing', 'incorrect', 'unexplained'))
         amt = g.get('invoiceAmount') or 0
         title = (f"{dot}  {g.get('groupName') or 'Unknown'}  "
                  f"·  {g.get('groupId') or '—'}  ·  ${amt:,.0f}")
@@ -351,30 +353,25 @@ else:
                 ok_n    = sum(1 for v in vals if v['status'] == 'ok')
                 miss_n  = sum(1 for v in vals if v['status'] == 'missing')
                 wrong_n = sum(1 for v in vals if v['status'] == 'incorrect')
+                unex_n  = sum(1 for v in vals if v['status'] == 'unexplained')
                 no_n    = sum(1 for v in vals if v['status'] == 'no_adj_needed')
 
-                # Mini-stats row
-                s1, s2, s3, s4 = st.columns(4)
-                s1.markdown(f'<div style="background:#dcfce7;padding:8px 12px;'
-                            f'border-radius:6px;text-align:center;">'
-                            f'<div style="font-size:11px;color:#166534;font-weight:600;">✅ OK</div>'
-                            f'<div style="font-size:22px;font-weight:700;color:#166534;">{ok_n}</div>'
-                            f'</div>', unsafe_allow_html=True)
-                s2.markdown(f'<div style="background:#fef3c7;padding:8px 12px;'
-                            f'border-radius:6px;text-align:center;">'
-                            f'<div style="font-size:11px;color:#b45309;font-weight:600;">🟡 MISSING</div>'
-                            f'<div style="font-size:22px;font-weight:700;color:#b45309;">{miss_n}</div>'
-                            f'</div>', unsafe_allow_html=True)
-                s3.markdown(f'<div style="background:#fee2e2;padding:8px 12px;'
-                            f'border-radius:6px;text-align:center;">'
-                            f'<div style="font-size:11px;color:#991b1b;font-weight:600;">🔴 INCORRECT</div>'
-                            f'<div style="font-size:22px;font-weight:700;color:#991b1b;">{wrong_n}</div>'
-                            f'</div>', unsafe_allow_html=True)
-                s4.markdown(f'<div style="background:#f3f4f6;padding:8px 12px;'
-                            f'border-radius:6px;text-align:center;">'
-                            f'<div style="font-size:11px;color:#374151;font-weight:600;">⚪ NO ADJ NEEDED</div>'
-                            f'<div style="font-size:22px;font-weight:700;color:#374151;">{no_n}</div>'
-                            f'</div>', unsafe_allow_html=True)
+                # Mini-stats row (5 tiles)
+                s1, s2, s3, s4, s5 = st.columns(5)
+                for col, label, count, bg, fg in [
+                    (s1, '✅ OK',              ok_n,    '#dcfce7', '#166534'),
+                    (s2, '🟡 MISSING',         miss_n,  '#fef3c7', '#b45309'),
+                    (s3, '🔴 INCORRECT',       wrong_n, '#fee2e2', '#991b1b'),
+                    (s4, '❓ UNEXPLAINED',     unex_n,  '#fce7f3', '#9d174d'),
+                    (s5, '⚪ NO ADJ NEEDED',   no_n,    '#f3f4f6', '#374151'),
+                ]:
+                    col.markdown(
+                        f'<div style="background:{bg};padding:8px 12px;'
+                        f'border-radius:6px;text-align:center;">'
+                        f'<div style="font-size:11px;color:{fg};font-weight:600;">{label}</div>'
+                        f'<div style="font-size:22px;font-weight:700;color:{fg};">{count}</div>'
+                        f'</div>', unsafe_allow_html=True,
+                    )
                 st.write("")
 
                 # Build a unified table — one row per member
@@ -383,6 +380,7 @@ else:
                         'ok':            '✅ OK',
                         'missing':       '🟡 MISSING',
                         'incorrect':     '🔴 INCORRECT',
+                        'unexplained':   '❓ UNEXPLAINED',
                         'no_adj_needed': '⚪ NO ADJ NEEDED',
                     }[v['status']],
                     'Member':  v['name'],
@@ -397,7 +395,8 @@ else:
                     if row['Status'].startswith('🔴'): bg = '#fee2e2'
                     elif row['Status'].startswith('🟡'): bg = '#fef3c7'
                     elif row['Status'].startswith('✅'): bg = '#dcfce7'
-                    else: bg = '#f3f4f6'  # no_adj_needed
+                    elif row['Status'].startswith('❓'): bg = '#fce7f3'
+                    else: bg = '#f3f4f6'
                     return [f'background-color: {bg}'] * len(row)
 
                 st.dataframe(
@@ -409,6 +408,7 @@ else:
                     "💡 **Legend** — **OK**: PDF matches Excel · "
                     "**MISSING**: Excel expects adjustment but PDF doesn't have it · "
                     "**INCORRECT**: PDF entry contradicts Excel · "
+                    "**UNEXPLAINED**: PDF has entry but Excel doesn't explain it (needs review) · "
                     "**NO ADJ NEEDED**: Member is in data window but no adjustment required."
                 )
 
