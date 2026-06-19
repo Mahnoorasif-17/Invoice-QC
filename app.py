@@ -14,6 +14,7 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
+import re
 
 from qc_engine import build_context, run_qc, auto_detect_month, MF
 from pdf_extractor import extract_pdf
@@ -426,7 +427,13 @@ else:
             with st.expander("🔎 Debug — raw extracted text from this PDF"):
                 st.text(g.get('_raw_text', '') or '(no text extracted)')
 
-    # ── EXPORTS ─────────────────────────────────────────────────────
+   # ── EXPORTS ─────────────────────────────────────────────────────
+    def sanitize(t):
+        for old, new in {'\u2014':'-','\u2013':'-','\u0394':'D','\u201c':'"','\u201d':'"','\u2018':"'",'\u2019':"'",'\u2026':'...'}.items():
+            t = t.replace(old, new)
+            t = re.sub(r'\s*\(D\$\d+\)', '', t)
+        return t
+
     st.divider()
     st.subheader("Export Reports")
 
@@ -436,19 +443,19 @@ else:
             for i in m['iss']:
                 issues_rows.append({
                     'Group ID':    g['groupId'],
-                    'Group Name':  g['groupName'],
-                    'Member':      m['name'],
+                    'Group Name':  sanitize(g['groupName']),
+                    'Member':      sanitize(m['name']),
                     'Severity':    i['sev'].upper(),
-                    'Message':     i['msg'],
+                    'Message':     sanitize(i['msg']),
                     'Invoice Amt': g.get('invoiceAmount') or 0,
                 })
         for a in g['la']:
             issues_rows.append({
                 'Group ID':    g['groupId'],
-                'Group Name':  g['groupName'],
-                'Member':      a['name'],
+                'Group Name':  sanitize(g['groupName']),
+                'Member':      sanitize(a['name']),
                 'Severity':    f"LATE {a['type'].upper()}",
-                'Message':     f"{a['month']} · {a['plan']} · ${abs(a['cost']):,.2f}",
+                'Message':     sanitize(f"{a['month']} · {a['plan']} · ${abs(a['cost']):,.2f}"),
                 'Invoice Amt': g.get('invoiceAmount') or 0,
             })
 
@@ -457,16 +464,15 @@ else:
         for v in g.get('validations', []):
             valid_rows.append({
                 'Group ID':        g['groupId'],
-                'Group Name':      g['groupName'],
-                'Member':          v['name'],
-                'Adjustment Type': v['type'],
-                'Months':          v.get('months', ''),
-                'Plan':            v.get('plan', ''),
+                'Group Name':      sanitize(g['groupName']),
+                'Member':          sanitize(v['name']),
+                'Adjustment Type': sanitize(v['type']),
+                'Months':          sanitize(v.get('months', '')),
+                'Plan':            sanitize(v.get('plan', '')),
                 'Amount':          v.get('cost') or 0,
                 'Status':          v['status'].upper(),
-                'Reason':          v['reason'],
+                'Reason':          sanitize(v['reason']),
             })
-
     e_col1, e_col2 = st.columns(2)
     with e_col1:
         if issues_rows:
