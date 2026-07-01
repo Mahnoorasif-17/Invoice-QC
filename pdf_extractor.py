@@ -50,6 +50,7 @@ def extract_pdf(file_obj) -> dict:
         'adjustmentCreditRoster': _parse_roster(text, 'ADJUSTMENTS - CREDITS ROSTER',
                                                 has_coverage_month=True),
         '_raw_text': text,
+        'cobraMembers': _parse_cobra_members(text),
     }
 
 
@@ -117,6 +118,24 @@ def _find_invoice_amount(text: str) -> Optional[float]:
             return _to_number(m.group(1))
     return None
 
+def _parse_cobra_members(text: str) -> set:
+    cobra_names = set()
+    # Find COBRA that appears as its own word on a line (the subsection header)
+    # Must NOT be preceded by ( or word characters on the same line
+    m = re.search(r'(?:^|\n)\s*COBRA\s*(?:\n|(?=\s+[A-Z]))', text)
+    if not m:
+        return cobra_names
+    after = text[m.end():m.end() + 1000]
+    chunk_m = re.search(r'Total\s*:', after, re.IGNORECASE)
+    chunk = after[:chunk_m.start()] if chunk_m else after
+    matches = re.findall(
+        r'([A-Z][a-zA-Z]+)\s+([A-Z][a-zA-Z]+)\s+(?:PM|PC|PS|PF|EE)\b',
+        chunk
+    )
+    for first, last in matches:
+        nk = re.sub(r'[^a-z]', '', (first + last).lower())
+        cobra_names.add(nk)
+    return cobra_names
 
 def _find_current_period_amount(text: str) -> Optional[float]:
     for pat in (
@@ -245,7 +264,7 @@ def _parse_roster_row(line: str, has_coverage_month: bool) -> Optional[dict]:
         # Coverage month looks like "Mar-2026", "January 2026", "Mar 2026"
         # Pattern: name(greedy)  tier  plan  coverage_month  cost
         m = re.match(
-            rf'^(.+?)\s+(\S+)\s+(\S+)\s+([A-Za-z]+[-\s]\d{{4}})\s+{cost_pattern}\s*$',
+            rf'^(.+?)\s+(\S+)\s+(\S+)\s+([A-Za-z]+[-\s]\d{{2,4}})\s+{cost_pattern}\s*$',
             line
         )
         if not m:

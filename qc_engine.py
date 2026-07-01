@@ -84,13 +84,17 @@ def normalize_plan(s: Any) -> str:
 
 
 def parse_month_string(s: Any) -> Optional[datetime]:
-    m = re.match(r'.*?([a-zA-Z]+)[^a-zA-Z0-9]*(\d{4})', str(s or ''))
+    m = re.match(r'.*?([a-zA-Z]+)[^a-zA-Z0-9]*(\d{2,4})', str(s or ''))
     if not m:
         return None
     mi = MONTH_MAP.get(m.group(1).lower()[:3])
     if mi is None:
         return None
-    return datetime(int(m.group(2)), mi + 1, 1)
+    year = int(m.group(2))
+    if year < 100:
+     year += 2000
+    return datetime(year, mi + 1, 1)
+   
 
 
 def format_amount(n: Any) -> str:
@@ -180,7 +184,7 @@ def build_context(invoice_month: int, invoice_year: int) -> dict:
 # ────────────────────────────────────────────────────────────────────
 def run_qc(rows: list, pdf_data: dict, ctx: dict) -> dict:
     # ── BILLING RULES 1-4 ───────────────────────────────────────────
-    member_issues = _run_billing_rules(rows, ctx)
+    member_issues = _run_billing_rules(rows, ctx, pdf_data.get('cobraMembers', set()))
 
     # ── LATE ADJUSTMENTS (>60 days) ─────────────────────────────────
     late_adj = _collect_late_adjustments(pdf_data, ctx)
@@ -216,7 +220,7 @@ def run_qc(rows: list, pdf_data: dict, ctx: dict) -> dict:
 # ────────────────────────────────────────────────────────────────────
 # BILLING RULES 1-4
 # ────────────────────────────────────────────────────────────────────
-def _run_billing_rules(rows: list, ctx: dict) -> list:
+def _run_billing_rules(rows: list, ctx: dict, cobra_members: set = None) -> list:
     member_issues = []
     for row in rows:
         fn = str(row.get('FirstName') or '').strip()
@@ -233,9 +237,11 @@ def _run_billing_rules(rows: list, ctx: dict) -> list:
         on = parse_date(row.get('EndedOn'))
 
         issues = []
-
+        nk = normalize_name(fn + ln)
+        is_cobra = cobra_members and nk in cobra_members
+        
         # Rule 1: Terminated but billed
-        if ch and ch > 0 and st == 'Terminated':
+        if ch and ch > 0 and st == 'Terminated' and not is_cobra:
             ed_s = ed.strftime('%m/%d/%Y') if ed else 'N/A'
             on_s = on.strftime('%m/%d/%Y') if on else 'N/A'
             issues.append({'sev': 'error',
@@ -251,12 +257,12 @@ def _run_billing_rules(rows: list, ctx: dict) -> list:
                     'msg': f"Active since {sd.strftime('%m/%d/%Y')} but NOT billed in current period"})
 
         # Rule 3: Future start (in a month AFTER invoice month) but billed
-        if ch and ch > 0 and sd and month_floor(sd) > ctx['invoiceStart']:
+        if ch and ch > 0 and sd and month_floor(sd) > ctx['invoiceStart'] and not is_cobra:
             issues.append({'sev': 'error',
                 'msg': f"Future start {sd.strftime('%m/%d/%Y')} but billed {format_amount(ch)}"})
 
         # Rule 4: SKU mismatch / PEPM
-        if ch and ch > 0 and pE and pS and pE != '0' and pS != '0':
+        if ch and ch > 0 and pE and pS and pE != '0' and pS != '0' and not is_cobra:
             if pE != pS:
                 issues.append({'sev': 'error',
                     'msg': f"SKU mismatch — EN: {pE} vs Invoice: {pS}"})
@@ -340,11 +346,14 @@ def validate_adjustments(rows: list, pdf_data: dict, ctx: dict) -> list:
     all_keys = set()
 
     # Add Excel members whose EnrolledOn or EndedOn falls in data window
+    cobra_members = pdf_data.get('cobraMembers', set())
     for nk, row in excel_by_name.items():
         eo = parse_date(row.get('EnrolledOn'))
         on = parse_date(row.get('EndedOn'))
+        st_val = str(row.get('EmploymentStatus') or '').strip()
         if (eo and in_window(eo, ctx['windowStart'], ctx['windowEnd'])) or \
-           (on and in_window(on, ctx['windowStart'], ctx['windowEnd'])):
+           (on and in_window(on, ctx['windowStart'], ctx['windowEnd'])) or \
+           (st_val == 'Terminated' and nk in cobra_members):
             all_keys.add(nk)
 
     # Add anyone with PDF entries
@@ -357,7 +366,7 @@ def validate_adjustments(rows: list, pdf_data: dict, ctx: dict) -> list:
         validations.append(_validate_one_member(
             nk, excel_by_name.get(nk),
             pdf_charges.get(nk, []), pdf_credits.get(nk, []),
-            ctx,
+            ctx, cobra_members,
         ))
 
     # Sort: incorrect → missing → unexplained → ok → no_adj_needed, then by name
@@ -373,6 +382,7 @@ def _validate_one_member(
     pdf_chgs: list,
     pdf_crds: list,
     ctx: dict,
+    cobra_members: set = None,
 ) -> dict:
     """Build one validation row for a single member (by name)."""
 
@@ -641,23 +651,26 @@ def _validate_one_member(
         reason = '; '.join(plan_change_notes)
 
     else:
-        # Excel-in-scope but no expectation, AND no PDF entries leftover → NO ADJ NEEDED
-        status = 'no_adj_needed'
-        reasons = []
-        if eo_in_window and (not sd or month_floor(sd) >= ctx['invoiceStart']):
-            if sd:
-                reasons.append(f"enrolled {eo.strftime('%m/%d/%Y')} but start "
-                               f"{sd.strftime('%m/%d/%Y')} is in invoice month — "
+        if cobra_members and nk in cobra_members:
+            status = 'ok'
+            reason = 'COBRA member — billed correctly in current period'
+        else:
+            status = 'no_adj_needed'
+            reasons = []
+            if eo_in_window and (not sd or month_floor(sd) >= ctx['invoiceStart']):
+                if sd:
+                    reasons.append(f"enrolled {eo.strftime('%m/%d/%Y')} but start "
+                                   f"{sd.strftime('%m/%d/%Y')} is in invoice month — "
+                                   f"regular billing covers")
+                else:
+                    reasons.append(f"enrolled {eo.strftime('%m/%d/%Y')} but no start date")
+            if on_in_window and ed and month_floor(ed) < ctx['invoiceStart']:
+                reasons.append(f"ended {ed.strftime('%m/%d/%Y')} — used insurance that month, "
+                               f"no credit needed")
+            if on_in_window and ed and month_floor(ed) >= ctx['invoiceStart']:
+                reasons.append(f"ended {ed.strftime('%m/%d/%Y')} — in invoice month, "
                                f"regular billing covers")
-            else:
-                reasons.append(f"enrolled {eo.strftime('%m/%d/%Y')} but no start date")
-        if on_in_window and ed and month_floor(ed) < ctx['invoiceStart']:
-            reasons.append(f"ended {ed.strftime('%m/%d/%Y')} — used insurance that month, "
-                           f"no credit needed")
-        if on_in_window and ed and month_floor(ed) >= ctx['invoiceStart']:
-            reasons.append(f"ended {ed.strftime('%m/%d/%Y')} — in invoice month, "
-                           f"regular billing covers")
-        reason = '; '.join(reasons) if reasons else 'In data window but no adjustments needed'
+            reason = '; '.join(reasons) if reasons else 'In data window but no adjustments needed'
 
     # ── 7. Compute total amount (charges positive, credits negative) ─
     total_amount = 0
